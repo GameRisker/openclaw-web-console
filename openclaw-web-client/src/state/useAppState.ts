@@ -13,7 +13,7 @@ import { mockSideCards, mockSessions } from './mockData'
 import { connectRealtime } from './realtime'
 import type { RealtimeEvent, ApiMessage, TimelineRenderItem, TimelineEventItem } from '../types/api'
 import type { AppState, SessionItem } from '../types/app'
-import { isUserFacingRole } from '../utils/roles'
+import { isUserFacingRole, timelineItemLooksLikeUserMessage } from '../utils/roles'
 
 const initialState: AppState = {
   authStatus: 'authenticated',
@@ -68,8 +68,11 @@ function touchSessionState(
 function toTimestampMs(value?: string) {
   if (!value) return 0
   const numeric = Number(value)
-  if (Number.isFinite(numeric) && numeric > 0) return numeric
-  const parsed = Date.parse(value)
+  if (Number.isFinite(numeric) && numeric > 0) {
+    if (numeric < 1e12) return Math.round(numeric * 1000)
+    return numeric
+  }
+  const parsed = Date.parse(String(value))
   return Number.isFinite(parsed) ? parsed : 0
 }
 
@@ -140,16 +143,24 @@ function mergeSnapshotRenderItems(
   previous: TimelineRenderItem[],
   sessionId: string,
 ): TimelineRenderItem[] {
+  const sameSession = (inc: TimelineRenderItem) => !inc.sessionId || inc.sessionId === sessionId
+
+  /** Only drop optimistic when the server echo is plausibly the same turn (avoid matching old user lines with same text). */
+  const serverEchoedOptimistic = (item: TimelineRenderItem, inc: TimelineRenderItem) => {
+    if (!sameSession(inc)) return false
+    if (!timelineItemLooksLikeUserMessage(inc)) return false
+    if (!userMessageContentMatches(inc.content, item.content)) return false
+    const optMs = toTimestampMs(item.timestamp)
+    const incMs = toTimestampMs(inc.timestamp)
+    if (optMs <= 0 || incMs <= 0) return false
+    return incMs >= optMs - 120_000
+  }
+
   const pending = previous.filter((item) => {
     if (item.sessionId !== sessionId) return false
     if (!String(item.id).startsWith('local-user-')) return false
-    if (item.kind !== 'user') return false
-    return !incoming.some(
-      (inc) =>
-        inc.kind === 'user' &&
-        userMessageContentMatches(inc.content, item.content) &&
-        inc.sessionId === sessionId,
-    )
+    if (!timelineItemLooksLikeUserMessage(item)) return false
+    return !incoming.some((inc) => serverEchoedOptimistic(item, inc))
   })
   if (pending.length === 0) return incoming
   return [...incoming, ...pending].sort((a, b) => {
@@ -219,6 +230,7 @@ export function useAppState() {
   const messagesRef = useRef<ApiMessage[]>([])
   const renderItemsRef = useRef<TimelineRenderItem[]>([])
   const refreshHistoryTimerRef = useRef<number | null>(null)
+  const queuedFallbackTimerRef = useRef<number | null>(null)
   const autoTitledSessionIdsRef = useRef<Set<string>>(new Set())
   const manuallyTitledSessionIdsRef = useRef<Set<string>>(new Set())
   const sessionsRef = useRef<SessionItem[]>(sessions)
@@ -238,6 +250,23 @@ export function useAppState() {
   useEffect(() => {
     renderItemsRef.current = renderItems
   }, [renderItems])
+
+  useEffect(() => {
+    if (state.sendStatus === 'queued') return
+    if (queuedFallbackTimerRef.current != null) {
+      window.clearTimeout(queuedFallbackTimerRef.current)
+      queuedFallbackTimerRef.current = null
+    }
+  }, [state.sendStatus])
+
+  useEffect(() => {
+    return () => {
+      if (queuedFallbackTimerRef.current != null) {
+        window.clearTimeout(queuedFallbackTimerRef.current)
+        queuedFallbackTimerRef.current = null
+      }
+    }
+  }, [])
 
   async function refreshSessions(preferredSessionId?: string) {
     const sessionsResult = await fetchSessions()
@@ -361,9 +390,17 @@ export function useAppState() {
             ...prev,
             historyStatus: 'ready',
             composerError: event.state === 'error' ? event.errorMessage || 'chat_event_error' : prev.composerError,
+            sendStatus:
+              prev.sendStatus === 'queued' && event.state !== 'final' && event.state !== 'error'
+                ? 'waiting-response'
+                : prev.sendStatus,
+            runtimeNote:
+              prev.sendStatus === 'queued' && event.state !== 'final' && event.state !== 'error'
+                ? 'streaming'
+                : prev.runtimeNote,
           }))
 
-          if ((event.state === 'final' || event.state === 'error') && messagesRef.current.length === 0) {
+          if (event.state === 'final' || event.state === 'error') {
             scheduleHistoryRefresh(currentSessionId, 120)
           }
         }
@@ -446,15 +483,31 @@ export function useAppState() {
         }
 
         if (event.type === 'message.upsert' && event.sessionId === currentSessionId) {
+          const msg = event.message
+          const modelSide =
+            msg &&
+            !isUserFacingRole(msg.role, msg.kind) &&
+            msg.kind !== 'user' &&
+            msg.role !== 'user'
           setState((prev) => ({
             ...prev,
             historyStatus: 'ready',
+            sendStatus: prev.sendStatus === 'queued' && modelSide ? 'waiting-response' : prev.sendStatus,
+            runtimeNote: prev.sendStatus === 'queued' && modelSide ? 'streaming' : prev.runtimeNote,
           }))
         }
 
         if (event.type === 'message.batch' && event.sessionId === currentSessionId) {
-          if (renderItemsRef.current.length === 0 && event.replace) {
-            setMessages(normalizeMessages(event.messages))
+          if (event.replace) {
+            const normalized = normalizeMessages(event.messages)
+            setMessages(normalized)
+            setRenderItems((prev) =>
+              mergeSnapshotRenderItems(
+                toRenderItemsFromMessages(normalized, event.sessionId),
+                prev,
+                event.sessionId,
+              ),
+            )
           }
           setState((prev) => ({
             ...prev,
@@ -557,7 +610,7 @@ export function useAppState() {
                     ? 'toolResult'
                     : item.kind === 'verbose'
                       ? 'verbose'
-                      : item.kind === 'user'
+                      : timelineItemLooksLikeUserMessage(item)
                         ? 'user'
                         : (item.kind as string) === 'text'
                           ? 'assistant'
@@ -568,7 +621,7 @@ export function useAppState() {
                   : item.kind === 'toolResult'
                     ? item.content.replace(/^\[toolResult\]\s*/i, '')
                     : item.content,
-              kind: item.kind,
+              kind: timelineItemLooksLikeUserMessage(item) ? 'user' : item.kind,
               label: item.label,
               toolName: item.toolName,
               runStatus: item.status,
@@ -578,11 +631,15 @@ export function useAppState() {
   )
 
   async function sendCurrentMessage() {
+    if (state.sendStatus === 'sending') return
+
     const draft = currentDraft.trim()
-    if (!draft || state.sendStatus === 'sending') return
 
     if (state.sendStatus === 'waiting-response') {
       await stopCurrentRun()
+      if (!draft) return
+      // 有草稿：先停当前轮再发下一条；无草稿：仅停止（修复空输入时点「Stop」被 !draft 挡掉的问题）
+    } else if (!draft) {
       return
     }
 
@@ -643,6 +700,26 @@ export function useAppState() {
         sendStatus: 'queued',
         runtimeNote: 'queued',
       }))
+      if (queuedFallbackTimerRef.current != null) {
+        window.clearTimeout(queuedFallbackTimerRef.current)
+      }
+      queuedFallbackTimerRef.current = window.setTimeout(() => {
+        queuedFallbackTimerRef.current = null
+        setState((prev) => {
+          if (prev.sendStatus !== 'queued') return prev
+          if (activeSessionIdRef.current !== sessionId) return prev
+          return {
+            ...prev,
+            sendStatus: 'waiting-response',
+            runtimeNote: 'awaiting gateway stream (history will refresh)',
+          }
+        })
+      }, 2500)
+      scheduleHistoryRefresh(sessionId, 600)
+      window.setTimeout(() => {
+        if (activeSessionIdRef.current !== sessionId) return
+        void refreshHistory(sessionId)
+      }, 3500)
     } catch (error) {
       setRenderItems((prev) =>
         prev.map((item) =>

@@ -91,7 +91,10 @@ async function listSessions() {
 
 async function resolveSession(sessionId) {
   const result = await listSessions()
-  const match = result.sessions.find((session) => session.sessionId === sessionId)
+  const id = String(sessionId)
+  const match = result.sessions.find(
+    (session) => String(session.sessionId ?? '') === id || String(session.key ?? '') === id,
+  )
   if (!match) {
     const error = new Error(`session_not_found:${sessionId}`)
     error.code = 'session_not_found'
@@ -109,7 +112,23 @@ function formatJsonBlock(value) {
   }
 }
 
-const USER_FACING_ROLES = new Set(['user', 'human', 'client', 'end_user', 'person', 'customer'])
+const USER_FACING_ROLES = new Set([
+  'user',
+  'human',
+  'client',
+  'end_user',
+  'person',
+  'customer',
+  'input',
+  'self',
+  'owner',
+  'local',
+  'player',
+  'participant',
+  'end-user',
+  'human_message',
+  'humanmessage',
+])
 
 function normalizeEndUserRole(role) {
   if (role == null || role === '') return 'assistant'
@@ -334,18 +353,92 @@ function toRunTimelineEvent({ sessionId, sessionKey, runId, state, stopReason, e
   }
 }
 
+function pickHistoryRole(message) {
+  if (message == null) return undefined
+  const direction = String(message.direction ?? message.flow ?? '').toLowerCase()
+  if (direction === 'out' || direction === 'outbound' || direction === 'upstream') return 'user'
+  const from = String(message.from ?? '').toLowerCase()
+  if (['user', 'client', 'human', 'local', 'self', 'operator'].includes(from)) return 'user'
+  const msgType = String(message.type ?? message.messageType ?? message.kind ?? '').toLowerCase()
+  if (
+    msgType === 'user' ||
+    msgType === 'human' ||
+    msgType === 'user_message' ||
+    msgType === 'prompt' ||
+    msgType.includes('human') ||
+    msgType.endsWith('_user')
+  ) {
+    return 'user'
+  }
+  return message.role ?? message.speaker ?? message.author ?? message.source
+}
+
+function pickHistoryContent(message) {
+  if (message == null) return ''
+  if (message.content != null) return message.content
+  if (message.text != null) return message.text
+  if (message.body != null) return message.body
+  if (typeof message.message === 'string') return message.message
+  if (message.message != null && typeof message.message === 'object' && message.message.content != null) {
+    return message.message.content
+  }
+  if (typeof message.prompt === 'string') return message.prompt
+  return ''
+}
+
+/** Turn gateway content into what contentParts() accepts (string or parts[]). */
+function normalizeHistoryContentForParts(content) {
+  if (content == null) return ''
+  if (typeof content === 'string' || Array.isArray(content)) return content
+  if (typeof content === 'object') {
+    if (Array.isArray(content.parts)) return content.parts
+    if (typeof content.text === 'string') return content.text
+    if (content.content != null) return normalizeHistoryContentForParts(content.content)
+    if (typeof content.message === 'string') return content.message
+  }
+  try {
+    return JSON.stringify(content)
+  } catch {
+    return String(content)
+  }
+}
+
 function mapHistoryMessages(sessionId, history) {
-  return history.messages.flatMap((message, index) => {
-    const baseId = message.runId || `${sessionId}-${index}`
-    const role = normalizeEndUserRole(message.role)
-    const parts = contentParts(message.content, role, message)
+  const rawMessages = Array.isArray(history?.messages)
+    ? history.messages
+    : Array.isArray(history?.items)
+      ? history.items
+      : []
+
+  return rawMessages.flatMap((message, index) => {
+    const baseId = message.runId || message.id || `${sessionId}-${index}`
+    const role = normalizeEndUserRole(pickHistoryRole(message))
+    const rawContent = pickHistoryContent(message)
+    const content = normalizeHistoryContentForParts(rawContent)
+    const parts = contentParts(content, role, message)
     if (parts.length === 0) {
-      const processed = processMessage({
-        id: `${baseId}:message:0`,
-        timestamp: message.timestamp ?? '',
-        role,
-        content: '',
-      }, { source: 'history', sessionId, message, index })
+      let fallbackText = ''
+      if (typeof rawContent === 'string') fallbackText = rawContent
+      else if (rawContent != null) {
+        const normalized = normalizeHistoryContentForParts(rawContent)
+        if (typeof normalized === 'string' && normalized) fallbackText = normalized
+        else {
+          try {
+            fallbackText = JSON.stringify(rawContent)
+          } catch {
+            fallbackText = String(rawContent)
+          }
+        }
+      }
+      const processed = processMessage(
+        {
+          id: `${baseId}:message:0`,
+          timestamp: message.timestamp ?? message.createdAt ?? message.ts ?? '',
+          role,
+          content: fallbackText,
+        },
+        { source: 'history', sessionId, message, index },
+      )
       return processed ? [processed] : []
     }
 
@@ -354,7 +447,7 @@ function mapHistoryMessages(sessionId, history) {
         processMessage(
           {
             id: `${baseId}:${part.kind || part.role || 'part'}:${part.order ?? partIndex}`,
-            timestamp: message.timestamp ?? '',
+            timestamp: message.timestamp ?? message.createdAt ?? message.ts ?? '',
             role: part.role ?? role,
             content: part.content,
             kind: part.kind,
@@ -368,6 +461,29 @@ function mapHistoryMessages(sessionId, history) {
   })
 }
 
+/**
+ * Gateway → bridge `chat` 事件：建议 payload 含 sessionKey、state（delta|final|error）、runId、message；
+ * 也接受 key / sessionId 别名，便于与 sessions.list、chat.send、chat.subscribe、chat.history 联调一致。
+ */
+function normalizeChatEventPayload(raw) {
+  if (raw == null || typeof raw !== 'object') return null
+  const sessionKey = raw.sessionKey ?? raw.key ?? raw.session_key
+  const sessionId = raw.sessionId ?? raw.session_id
+  const runId = raw.runId ?? raw.run_id
+  const state = raw.state ?? raw.phase ?? raw.status
+  const errorMessage = raw.errorMessage ?? raw.error?.message ?? (typeof raw.error === 'string' ? raw.error : undefined)
+  const stopReason = raw.stopReason ?? raw.stop_reason
+  return {
+    ...raw,
+    sessionKey: sessionKey ? String(sessionKey) : undefined,
+    sessionId: sessionId != null && sessionId !== '' ? String(sessionId) : undefined,
+    runId,
+    state,
+    errorMessage,
+    stopReason,
+  }
+}
+
 class NativeGatewayBridge {
   constructor() {
     this.ws = null
@@ -378,6 +494,8 @@ class NativeGatewayBridge {
     this.pending = new Map()
     this.sessionToClients = new Map()
     this.sessionKeyToId = new Map()
+    /** Web 客户端用的 sessionId（sessions.list.sessionId）→ 当前订阅的 sessionKey */
+    this.sessionIdToKey = new Map()
     this.clientToSession = new Map()
     this.reconnectTimer = null
     this.subscribedSessionKeys = new Set()
@@ -480,13 +598,16 @@ class NativeGatewayBridge {
         }
 
         if (msg.type === 'event' && msg.event === 'chat') {
+          const rawPayload = msg.payload ?? msg.data ?? msg.body
+          const normalized = normalizeChatEventPayload(rawPayload)
           bridgeLog('gateway.chat.event', {
-            sessionKey: msg.payload?.sessionKey,
-            state: msg.payload?.state,
-            runId: msg.payload?.runId,
-            hasMessage: !!msg.payload?.message,
+            sessionKey: normalized?.sessionKey,
+            sessionId: normalized?.sessionId,
+            state: normalized?.state,
+            runId: normalized?.runId,
+            hasMessage: !!normalized?.message,
           })
-          this.handleChatEvent(msg.payload)
+          this.handleChatEvent(normalized ?? rawPayload)
           return
         }
 
@@ -560,6 +681,9 @@ class NativeGatewayBridge {
         prevClients.delete(clientId)
         if (prevClients.size === 0) {
           this.sessionToClients.delete(previous)
+          const prevSid = this.sessionKeyToId.get(previous)
+          if (prevSid != null) this.sessionIdToKey.delete(prevSid)
+          this.sessionKeyToId.delete(previous)
           this.send({
             type: 'req',
             id: `unsub:${previous}`,
@@ -572,6 +696,7 @@ class NativeGatewayBridge {
 
     this.clientToSession.set(clientId, sessionKey)
     this.sessionKeyToId.set(sessionKey, sessionId)
+    this.sessionIdToKey.set(String(sessionId), sessionKey)
 
     let clients = this.sessionToClients.get(sessionKey)
     if (!clients) {
@@ -605,6 +730,9 @@ class NativeGatewayBridge {
     if (clients.size === 0) {
       this.sessionToClients.delete(sessionKey)
       this.subscribedSessionKeys.delete(sessionKey)
+      const sid = this.sessionKeyToId.get(sessionKey)
+      if (sid != null) this.sessionIdToKey.delete(String(sid))
+      this.sessionKeyToId.delete(sessionKey)
       const pendingTimer = this.pendingChatTimers.get(sessionKey)
       if (pendingTimer) {
         clearTimeout(pendingTimer)
@@ -793,13 +921,32 @@ class NativeGatewayBridge {
   }
 
   handleChatEvent(payload) {
-    const sessionKey = payload?.sessionKey
-    if (!sessionKey) return
+    if (payload == null || typeof payload !== 'object') return
+    let sessionKey = payload.sessionKey
+    if (!sessionKey && payload.sessionId != null) {
+      sessionKey = this.sessionIdToKey.get(String(payload.sessionId))
+    }
+    if (!sessionKey) {
+      bridgeLog('gateway.chat.event.skipped', {
+        reason: 'no_session_key',
+        sessionId: payload.sessionId,
+        keys: Object.keys(payload).slice(0, 12),
+      })
+      return
+    }
     const sessionId = this.sessionKeyToId.get(sessionKey)
     const clients = this.sessionToClients.get(sessionKey)
-    if (!sessionId || !clients || clients.size === 0) return
+    if (!sessionId || !clients || clients.size === 0) {
+      bridgeLog('gateway.chat.event.skipped', {
+        reason: 'no_subscribed_clients',
+        sessionKey,
+        sessionId: sessionId ?? null,
+        clientCount: clients?.size ?? 0,
+      })
+      return
+    }
 
-    this.pendingChatEvents.set(sessionKey, payload)
+    this.pendingChatEvents.set(sessionKey, { ...payload, sessionKey })
     const pendingTimer = this.pendingChatTimers.get(sessionKey)
     if (pendingTimer) clearTimeout(pendingTimer)
 

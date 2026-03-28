@@ -27,10 +27,16 @@ export async function sendSessionMessage(sessionId: string, message: string) {
     body: JSON.stringify({ message }),
   })
 
-  const result = await response.json()
+  let result: { message?: string; error?: string } = {}
+  try {
+    result = (await response.json()) as typeof result
+  } catch {
+    if (!response.ok) throw new Error(`send_failed (${response.status})`)
+    return {}
+  }
 
   if (!response.ok) {
-    throw new Error(result.message || result.error || 'send_failed')
+    throw new Error(result.message || result.error || `send_failed (${response.status})`)
   }
 
   return result

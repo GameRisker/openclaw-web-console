@@ -335,6 +335,7 @@ textarea {
 .message-row {
   display: flex;
   width: 100%;
+  min-width: 0;
 }
 
 .message-row.user {
@@ -411,6 +412,7 @@ textarea {
   overflow: hidden;
   height: 100%;
   min-height: 0;
+  min-width: 0;
 }
 
 .chat-header {
@@ -436,6 +438,7 @@ textarea {
   overflow-y: auto;
   overflow-x: hidden;
   min-height: 0;
+  min-width: 0;
   height: 100%;
   align-content: start;
   align-items: start;
@@ -443,20 +446,28 @@ textarea {
   scroll-behavior: smooth;
 }
 
+/* Grid 子项默认 min-width:auto，宽屏 + 右对齐气泡会被 overflow 裁切；允许在列宽内收缩 */
+.message-list > .message-row {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* 列表内提示条（非 message-row）仍占满可用宽度 */
 .message-card {
   width: min(100%, 760px);
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
-.message-row.user .message-card {
-  width: min(78%, 760px);
-}
-
-.message-row.assistant .message-card,
-.message-row.verbose .message-card,
-.message-row.tool .message-card,
-.message-row.system .message-card,
-.message-row.muted .message-card {
-  width: min(88%, 760px);
+/* 会话气泡统一：禁止 flex 压扁、短内容最小宽度、长内容上限（用户右对齐 / 助手左对齐仅由 .message-row 决定） */
+.message-row .message-card {
+  flex: 0 0 auto;
+  flex-shrink: 0;
+  width: fit-content;
+  max-width: min(100%, 85%, 720px);
+  min-width: min(240px, 100%);
+  box-sizing: border-box;
 }
 
 .message-card-header {
@@ -583,6 +594,8 @@ textarea {
   border-radius: 10px;
   background: rgba(2, 6, 23, 0.55);
   overflow-x: auto;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .markdown-content pre code {
@@ -854,14 +867,11 @@ textarea {
     gap: 10px;
   }
 
-  .message-row.user .message-card,
-  .message-row.assistant .message-card,
-  .message-row.verbose .message-card,
-  .message-row.tool .message-card,
-  .message-row.system .message-card,
-  .message-row.muted .message-card,
+  .message-row .message-card,
   .message-card {
     width: 100%;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .composer {

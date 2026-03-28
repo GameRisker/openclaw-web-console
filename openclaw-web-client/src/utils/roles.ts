@@ -1,5 +1,21 @@
 /** Roles that represent the end-user / operator message in chat history (gateway variants). */
-const USER_FACING_ROLES = new Set(['user', 'human', 'client', 'end_user', 'person', 'customer'])
+const USER_FACING_ROLES = new Set([
+  'user',
+  'human',
+  'client',
+  'end_user',
+  'person',
+  'customer',
+  'input',
+  'self',
+  'owner',
+  'local',
+  'player',
+  'participant',
+  'end-user',
+  'human_message',
+  'humanmessage',
+])
 
 export function normalizeEndUserRole(role: string | undefined | null): string {
   if (role == null || role === '') return 'assistant'
@@ -11,4 +27,10 @@ export function normalizeEndUserRole(role: string | undefined | null): string {
 export function isUserFacingRole(role: string | undefined | null, kind?: string | undefined | null): boolean {
   if (kind === 'user') return true
   return normalizeEndUserRole(role) === 'user'
+}
+
+/** Timeline rows from the bridge may omit kind but still use title "You". */
+export function timelineItemLooksLikeUserMessage(item: { kind?: string; title?: string }): boolean {
+  if (item.kind === 'user') return true
+  return String(item.title ?? '').trim() === 'You'
 }
