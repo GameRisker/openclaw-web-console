@@ -1,0 +1,45 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试前端 (内置浏览器)",
+      "type": "editor-browser",
+      "request": "launch",
+      "url": "http://127.0.0.1:5173",
+      "webRoot": "${workspaceFolder}",
+      "preLaunchTask": "dev: full stack"
+    },
+    {
+      "name": "内置浏览器（全栈已启动）",
+      "type": "editor-browser",
+      "request": "launch",
+      "url": "http://127.0.0.1:5173",
+      "webRoot": "${workspaceFolder}"
+    },
+    {
+      "name": "调试前端 (Chrome)",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://127.0.0.1:5173",
+      "webRoot": "${workspaceFolder}",
+      "preLaunchTask": "dev: full stack"
+    },
+    {
+      "name": "调试 API (Node)",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "node",
+      "program": "${workspaceFolder}/../openclaw-web-api/server.mjs",
+      "cwd": "${workspaceFolder}/..",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"]
+    },
+    {
+      "name": "Chrome（全栈已在终端启动）",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://127.0.0.1:5173",
+      "webRoot": "${workspaceFolder}"
+    }
+  ]
+}

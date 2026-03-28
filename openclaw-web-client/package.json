@@ -1,0 +1,14 @@
+{
+  "name": "openclaw-web-client",
+  "private": true,
+  "type": "module",
+  "description": "Vite/React UI; install dependencies from repo root (parent) with npm install",
+  "scripts": {
+    "dev": "cd .. && npm run dev",
+    "dev:web": "cd .. && npm run dev:web",
+    "dev:api": "cd .. && npm run dev:api",
+    "build": "cd .. && npm run build",
+    "lint": "cd .. && npm run lint",
+    "preview": "cd .. && npm run preview"
+  }
+}
