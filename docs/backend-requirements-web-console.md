@@ -98,4 +98,38 @@
 
 ---
 
+## 7. `GET /api/models`（可配置模型列表，桥接已实现）
+
+桥接按顺序调用本机 `openclaw`，**首次成功返回非空列表即停止**：
+
+1. `openclaw status --json` — 若 JSON 中含 `models` / `configuredModels` / `allowedModels` 等数组（供未来 OpenClaw 在 status 内嵌列表）。
+2. `openclaw models list --json` — 解析 `models[]`（元素常见字段 `key`、`name`）。
+3. `openclaw model list --json` — 同上结构（若 CLI 提供该子命令）。
+4. `openclaw models status --json` — 解析 `allowed[]` 字符串列表，并附带 `defaultModel`、`fallbacks`、`aliases` 等元数据。
+5. `openclaw models --status-json` — 与上等价。
+
+响应 JSON：`schemaVersion`、`source`（实际命中命令说明）、`models[]`。每个元素至少含 **`id`**、**`model`**、**`name`**、**`label`**（与 `name` 相同，兼容旧前端）、可选 **`modelProvider`**；来自 `models list` 时还可含 **`available`**、**`tags`**。另可含 **`defaultModel`**、**`fallbacks`** 等。
+
+> 当前 CLI 中 `openclaw models --json` 无效；请使用 **`models list --json`** / **`models status --json`**。若需在 `status --json` 中直接提供模型数组，由 OpenClaw 发版后桥接第 1 步即可生效。
+
+---
+
+## 8. 会话 verbose / think / patch / compact（桥接已实现）
+
+- **`GET /api/sessions`（网关 `sessions.list`）**  
+  每条 session 经桥接 `normalizeSession` 后包含 **`verbose`**（布尔，网关未给时默认为 `false`）、**`think`**（`low` \| `high` \| `off`，未识别则为省略）。  
+  读取顺序：`think` / `thinkLevel` / `thinking` / `thinkingLevel`；常见别名会映射到三档（如 `minimal`→`low`，`xhigh`→`high`）。
+
+- **`POST /api/sessions/:sessionId/patch`**  
+  白名单：**`label`、`model`、`modelProvider`、`verbose`、`think`**。  
+  多余字段 → **400** `unknown_fields`；`think` 非 low/high/off → **400** `invalid_think`；`verbose` 非布尔 → **400** `invalid_verbose`。  
+  调用网关时除 `think` 外会附带 **`thinkLevel`**（同值）以兼容旧字段名。
+
+- **`POST /api/sessions/:sessionId/compact`**  
+  默认 **`OPENCLAW_COMPACT_METHOD=auto`**：依次尝试 **`sessions.compact`**、**`chat.compact`**（参数 `{ sessionKey }`）；若判定为「方法不存在」类错误则回退 **`chat.send` `/compact`**。  
+  可设为 **`slash`** 强制仅斜杠；**`sessions.compact`** / **`chat.compact`** 仅调单一 RPC（失败则直接报错）。  
+  响应体含 **`via`** 字段标明实际路径。
+
+---
+
 *文档版本：与当前 Web 客户端行为对齐；网关变更时请同步更新本文与 `session-history-pagination.md`。*

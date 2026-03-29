@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import type { KeyboardEvent } from 'react'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
@@ -11,7 +12,10 @@ import {
   type SlashCommand,
 } from '../lib/slashCommands'
 import { isUserFacingRole } from '../utils/roles'
+import { formatContextUsageLine } from '../utils/formatTokens'
+import type { SideCard } from '../types/app'
 import type { ApiMessage } from '../types/api'
+import { ContextSessionSettings } from '../features/context-panel/ContextSessionSettings'
 import { DeleteSessionConfirmModal, RenameSessionDialog, SessionListPanel } from '../features/session-list'
 
 function getConnectionPillClass(status: string) {
@@ -295,14 +299,6 @@ function formatElapsed(ms: number) {
   return `${minutes}m ${remainSeconds}s`
 }
 
-function formatTokenCount(value?: number) {
-  if (typeof value !== 'number') return undefined
-  const kb = value / 1024
-  if (kb >= 100) return `${Math.round(kb)}KB`
-  if (kb >= 10) return `${kb.toFixed(1)}KB`
-  return `${kb.toFixed(2)}KB`
-}
-
 function toMessageTimeMs(ts?: string): number {
   if (!ts) return 0
   const numeric = Number(ts)
@@ -349,6 +345,79 @@ function formatMessageTimeMeta(timestamp?: string): { label: string; iso: string
   return { label, iso: d.toISOString(), title }
 }
 
+const CONTEXT_DRAWER_MAX_WIDTH_MQ = '(max-width: 1080px)'
+
+function useContextDrawerNarrow() {
+  const [narrow, setNarrow] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia(CONTEXT_DRAWER_MAX_WIDTH_MQ).matches,
+  )
+  useEffect(() => {
+    const mq = window.matchMedia(CONTEXT_DRAWER_MAX_WIDTH_MQ)
+    const onChange = () => setNarrow(mq.matches)
+    onChange()
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return narrow
+}
+
+function ContextGearIcon() {
+  return (
+    <svg
+      className="context-gear-icon"
+      viewBox="0 0 24 24"
+      width={14}
+      height={14}
+      aria-hidden
+      focusable="false"
+    >
+      <path
+        fill="currentColor"
+        d="M19.43 12.98c.04-.32.07-.65.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.39-1.09-.68-1.69-.87l-.38-2.65A.506.506 0 0016 2h-4c-.25 0-.46.18-.5.42l-.38 2.65c-.6.19-1.17.48-1.69.87l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.31.61.22l2.49-1c.52.39 1.09.68 1.69.87l.38 2.65c.05.24.25.42.5.42h4c.25 0 .45-.18.5-.42l.38-2.65c.6-.19 1.17-.48 1.69-.87l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"
+      />
+    </svg>
+  )
+}
+
+function ContextSidebar({
+  sideCards,
+  onCollapse,
+  titleId,
+  sessionSettings,
+}: {
+  sideCards: SideCard[]
+  onCollapse: () => void
+  titleId?: string
+  sessionSettings?: ReactNode
+}) {
+  return (
+    <>
+      <div className="panel-header">
+        <div>
+          <h2 id={titleId}>Context / Control</h2>
+          <p>会话摘要、运行状态与模型信息</p>
+        </div>
+        <button type="button" className="icon-button" onClick={onCollapse} aria-label="收起 Context 栏" title="收起">
+          ◀
+        </button>
+      </div>
+      <div className="context-cards">
+        {sessionSettings}
+        {sideCards.map((card) => (
+          <section key={card.title} className="context-card">
+            <h3>{card.title}</h3>
+            <ul>
+              {card.items.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          </section>
+        ))}
+      </div>
+    </>
+  )
+}
+
 export function AppShellPage() {
   const {
     state,
@@ -367,9 +436,32 @@ export function AppShellPage() {
     loadOlderHistory,
     createNewSession,
     commitRenameSession,
+    patchActiveSessionSettings,
+    compactActiveSession,
     removeSession,
     modelSideStreaming,
   } = useAppState()
+
+  const contextDrawerNarrow = useContextDrawerNarrow()
+  const contextPanelOpen = !state.isRightSidebarCollapsed
+
+  useEffect(() => {
+    if (!contextDrawerNarrow || !contextPanelOpen) return
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') toggleRightSidebar()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [contextDrawerNarrow, contextPanelOpen, toggleRightSidebar])
+
+  useEffect(() => {
+    if (!contextDrawerNarrow || !contextPanelOpen) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = prev
+    }
+  }, [contextDrawerNarrow, contextPanelOpen])
 
   const messageListRef = useRef<HTMLDivElement | null>(null)
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
@@ -396,22 +488,7 @@ export function AppShellPage() {
   const runtimeBadge = getRuntimeBadge(state.toolActivityStatus)
   const sendButton = getSendButtonMeta(state.sendStatus)
   const [waitElapsedMs, setWaitElapsedMs] = useState(0)
-  const contextTokenLabel = formatTokenCount(activeSession.contextTokens)
-  const totalTokenLabel = formatTokenCount(activeSession.totalTokens)
-  const ctxN = activeSession.contextTokens
-  const totN = activeSession.totalTokens
-  /** 网关的 contextTokens/totalTokens 未必是「已用/上限」；仅当分母 ≥ 分子时百分比才有意义 */
-  const tokenLine =
-    contextTokenLabel && totalTokenLabel
-      ? typeof ctxN === 'number' &&
-          typeof totN === 'number' &&
-          totN > 0 &&
-          ctxN <= totN
-        ? `tokens ${contextTokenLabel}/${totalTokenLabel} (${Math.round((ctxN / totN) * 100)}%)`
-        : `tokens ctx ${contextTokenLabel} · ${totalTokenLabel}`
-      : totalTokenLabel
-        ? `tokens ${totalTokenLabel}`
-        : undefined
+  const tokenLine = formatContextUsageLine(activeSession.contextTokens, activeSession.totalTokens)
 
   const statusToneClass =
     state.toolActivityStatus === 'failed'
@@ -422,11 +499,15 @@ export function AppShellPage() {
           ? 'busy'
           : 'idle'
 
+  const metaThinkRaw = String(activeSession.think ?? '').trim().toLowerCase()
+  const metaThink =
+    metaThinkRaw === 'low' || metaThinkRaw === 'high' || metaThinkRaw === 'off' ? metaThinkRaw : 'low'
+  const metaVerboseOn = typeof activeSession.verbose === 'boolean' ? activeSession.verbose : true
+
   const sessionMeta = [
     activeSession.model ? `${activeSession.modelProvider ? `${activeSession.modelProvider}/` : ''}${activeSession.model}` : undefined,
-    'agent main',
-    'think low',
-    'verbose on',
+    `think ${metaThink}`,
+    metaVerboseOn ? 'verbose on' : 'verbose off',
     tokenLine,
     state.lastRunDurationMs ? `last ${formatDuration(state.lastRunDurationMs)}` : undefined,
   ]
@@ -774,6 +855,19 @@ export function AppShellPage() {
     }
   }
 
+  const contextSessionSettingsEl = (
+    <ContextSessionSettings
+      sessionId={activeSession.id}
+      label={activeSession.summary}
+      model={activeSession.model}
+      modelProvider={activeSession.modelProvider}
+      verbose={activeSession.verbose}
+      think={activeSession.think}
+      onPatch={patchActiveSessionSettings}
+      onCompact={compactActiveSession}
+    />
+  )
+
   return (
     <main className="console-page">
       <RenameSessionDialog
@@ -801,8 +895,7 @@ export function AppShellPage() {
       )}
       <header className="topbar">
         <div>
-          <div className="eyebrow">OpenClaw Console</div>
-          <h1>Web UI MVP</h1>
+          <h1>OpenClaw Console</h1>
         </div>
 
         <div className="topbar-statuses">
@@ -892,11 +985,16 @@ export function AppShellPage() {
                   {state.toolActivityStatus}
                 </span>
               )}
-              {state.isRightSidebarCollapsed && (
-                <button className="icon-button" onClick={toggleRightSidebar}>
-                  Context ▶
-                </button>
-              )}
+              <button
+                type="button"
+                className={`icon-button context-gear-button${contextPanelOpen ? ' context-gear-button--open' : ''}`}
+                onClick={toggleRightSidebar}
+                aria-label={contextPanelOpen ? '关闭 Context 面板' : '打开 Context 面板'}
+                aria-expanded={contextPanelOpen}
+                title={contextPanelOpen ? '关闭 Context' : 'Context 与运行信息'}
+              >
+                <ContextGearIcon />
+              </button>
             </div>
           </div>
 
@@ -1165,33 +1263,40 @@ export function AppShellPage() {
           </div>
         </section>
 
-        {!state.isRightSidebarCollapsed && (
-          <aside className="panel context-panel">
-            <div className="panel-header">
-              <div>
-                <h2>Context / Control</h2>
-                <p>默认折叠，展开后承载轻控制能力</p>
-              </div>
-              <button className="icon-button" onClick={toggleRightSidebar}>
-                ▶
-              </button>
-            </div>
-
-            <div className="context-cards">
-              {sideCards.map((card) => (
-                <section key={card.title} className="context-card">
-                  <h3>{card.title}</h3>
-                  <ul>
-                    {card.items.map((item) => (
-                      <li key={item}>{item}</li>
-                    ))}
-                  </ul>
-                </section>
-              ))}
-            </div>
+        {!contextDrawerNarrow && contextPanelOpen && (
+          <aside className="panel context-panel" aria-label="Context 侧栏">
+            <ContextSidebar
+              sideCards={sideCards}
+              onCollapse={toggleRightSidebar}
+              sessionSettings={contextSessionSettingsEl}
+            />
           </aside>
         )}
       </section>
+
+      {contextDrawerNarrow && contextPanelOpen && (
+        <>
+          <button
+            type="button"
+            className="context-drawer-backdrop"
+            aria-label="关闭 Context 面板"
+            onClick={toggleRightSidebar}
+          />
+          <aside
+            className="panel context-panel context-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="context-drawer-title"
+          >
+            <ContextSidebar
+              sideCards={sideCards}
+              onCollapse={toggleRightSidebar}
+              titleId="context-drawer-title"
+              sessionSettings={contextSessionSettingsEl}
+            />
+          </aside>
+        </>
+      )}
 
       {state.isSettingsOpen && (
         <aside className="settings-drawer">

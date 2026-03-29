@@ -12,6 +12,10 @@ export interface ApiSession {
   kind?: string
   label?: string
   displayName?: string
+  /** 会话列表若返回，则 Context 可展示当前 verbose / think */
+  verbose?: boolean
+  think?: string
+  thinkLevel?: string
 }
 
 export interface ApiMessage {

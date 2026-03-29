@@ -460,6 +460,28 @@ textarea {
   gap: 10px;
 }
 
+.context-gear-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px;
+  min-width: 28px;
+  min-height: 28px;
+  flex-shrink: 0;
+  border-radius: 8px;
+}
+
+.context-gear-button--open {
+  background: rgba(37, 99, 235, 0.22);
+  color: #bfdbfe;
+}
+
+.context-gear-icon {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
 .session-toolbar,
 .context-cards,
 .composer {
@@ -1472,6 +1494,114 @@ textarea {
   padding-left: 18px;
 }
 
+.context-card--session-settings .context-settings-hint {
+  margin: 0 0 12px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #64748b;
+}
+
+.context-card--session-settings .context-settings-hint code {
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(15, 23, 42, 0.6);
+  color: #94a3b8;
+}
+
+.context-settings-form {
+  display: grid;
+  gap: 10px;
+}
+
+.context-settings-field {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.context-settings-field-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.context-settings-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.72);
+  color: #e2e8f0;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+}
+
+.context-settings-input:focus {
+  border-color: rgba(96, 165, 250, 0.45);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.context-settings-error {
+  margin: 0;
+  font-size: 12px;
+  color: #fca5a5;
+}
+
+.context-settings-ok {
+  margin: 0;
+  font-size: 12px;
+  color: #86efac;
+}
+
+.context-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.context-settings-submit {
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.context-settings-submit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.context-settings-select {
+  cursor: pointer;
+  appearance: auto;
+}
+
+.context-settings-field--compact {
+  margin-top: 4px;
+}
+
+.context-settings-compact-btn {
+  width: fit-content;
+}
+
+.context-settings-compact-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.context-settings-muted {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #64748b;
+}
+
+.context-settings-input--tight {
+  margin-top: 8px;
+}
+
 .settings-drawer {
   position: fixed;
   top: 24px;
@@ -1495,7 +1625,32 @@ textarea {
   gap: 16px;
 }
 
-/* 中等宽度：仍保留会话 + 聊天 + 右侧栏，直至较窄再收起 Context */
+/* 窄于三栏时 Context 由 AppShell 以抽屉渲染，不再在网格内占位 */
+.context-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  margin: 0;
+  border: none;
+  padding: 0;
+  background: rgba(15, 23, 42, 0.52);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  cursor: pointer;
+}
+
+.context-panel.context-drawer {
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top, 0px));
+  right: max(12px, env(safe-area-inset-right, 0px));
+  bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  width: min(360px, calc(100vw - 24px));
+  max-width: 100%;
+  z-index: 130;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.55);
+}
+
+/* 中等宽度：两栏布局；Context 见抽屉（≤1080px） */
 @media (max-width: 1080px) {
   .console-grid,
   .console-grid.right-collapsed {
@@ -1505,10 +1660,6 @@ textarea {
   .console-grid.left-collapsed,
   .console-grid.left-collapsed.right-collapsed {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .context-panel {
-    display: none;
   }
 }
 
@@ -1577,8 +1728,7 @@ textarea {
     margin-top: 8px;
   }
 
-  .sidebar-panel,
-  .context-panel {
+  .sidebar-panel {
     display: none;
   }
 
@@ -1600,6 +1750,23 @@ textarea {
   .topbar-statuses,
   .chat-header-actions {
     justify-content: flex-start;
+  }
+
+  /* 避免与 .panel-header 纵向堆叠后齿轮被挤到难发现的位置：标题与操作同一行、齿轮靠右 */
+  .chat-header.panel-header {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .chat-header .chat-title-wrap {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .chat-header .chat-header-actions {
+    margin-left: auto;
+    flex-shrink: 0;
   }
 
   .message-list {

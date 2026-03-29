@@ -6,14 +6,17 @@ import {
   fetchSessionHistory,
   fetchSessions,
   fetchStatus,
+  compactSession,
+  patchSessionSettings,
   renameSession,
   sendSessionMessage,
+  type SessionPatchPayload,
 } from './api'
-import { mockSideCards, mockSessions } from './mockData'
 import { connectRealtime } from './realtime'
 import { openclawWebLog } from './debugLog'
 import type { RealtimeEvent, ApiMessage, ApiSession, TimelineRenderItem, TimelineEventItem } from '../types/api'
-import type { AppState, HistoryStatus, SessionItem } from '../types/app'
+import type { AppState, HistoryStatus, SessionItem, SideCard } from '../types/app'
+import { formatContextUsageLine } from '../utils/formatTokens'
 import { isUserFacingRole, timelineItemLooksLikeUserMessage } from '../utils/roles'
 import { HISTORY_FETCH_MAX, HISTORY_OLDER_STEP, HISTORY_PAGE_SIZE } from '../constants/history'
 
@@ -21,7 +24,7 @@ const initialState: AppState = {
   authStatus: 'authenticated',
   connectionStatus: 'connecting',
   sessionListStatus: 'loading',
-  activeSessionId: 'main',
+  activeSessionId: '',
   historyHasMore: false,
   historyLoadingOlder: false,
   historyStatus: 'loading-history',
@@ -31,9 +34,7 @@ const initialState: AppState = {
   isRightSidebarCollapsed: true,
   isSettingsOpen: false,
   sessionSearch: '',
-  draftBySession: {
-    main: '',
-  },
+  draftBySession: {},
   composerError: undefined,
   runtimeNote: 'booting',
   currentRunStartedAt: undefined,
@@ -439,11 +440,10 @@ function cloneRenderItemsForCache(items: TimelineRenderItem[]): TimelineRenderIt
 
 export function useAppState() {
   const [state, setState] = useState<AppState>(initialState)
-  const [sessions, setSessions] = useState<SessionItem[]>(mockSessions)
+  const [sessions, setSessions] = useState<SessionItem[]>([])
   const [messages, setMessages] = useState<ApiMessage[]>([])
   const [_timelineEvents, setTimelineEvents] = useState<TimelineEventItem[]>([])
   const [renderItems, setRenderItems] = useState<TimelineRenderItem[]>([])
-  const [statusSummary, setStatusSummary] = useState<string[]>(mockSideCards[1].items)
   const realtimeRef = useRef<ReturnType<typeof connectRealtime> | null>(null)
   const activeSessionIdRef = useRef(state.activeSessionId)
   const messagesRef = useRef<ApiMessage[]>([])
@@ -489,14 +489,41 @@ export function useAppState() {
     }
   }, [])
 
-  async function refreshSessions(preferredSessionId?: string) {
+  /** 列表常不带 verbose/think；保存后合并本次 patch 与上一轮本地值，避免 Context 被默认「开」冲掉 */
+  async function refreshSessions(
+    preferredSessionId?: string,
+    mergeHint?: { sessionId: string; verbose?: boolean; think?: 'low' | 'high' | 'off' },
+  ) {
     const sessionsResult = await fetchSessions()
     const prevById = new Map(sessionsRef.current.map((s) => [s.id, s]))
+    const mergeId = mergeHint?.sessionId
     const mappedSessions = sessionsResult.sessions
       .map((session) => {
         const id = session.sessionId
+        const prev = prevById.get(id)
         const updatedAt =
           typeof session.updatedAt === 'number' ? session.updatedAt : toTimestampMs(String(session.updatedAt ?? ''))
+        const vApi = typeof session.verbose === 'boolean' ? session.verbose : undefined
+        const vFromPatch =
+          mergeId === id && typeof mergeHint?.verbose === 'boolean' ? mergeHint.verbose : undefined
+        const vPrev = typeof prev?.verbose === 'boolean' ? prev.verbose : undefined
+        const verbose = vApi !== undefined ? vApi : vFromPatch !== undefined ? vFromPatch : vPrev
+
+        const thinkFromApi = (() => {
+          const raw = session.think ?? session.thinkLevel
+          if (raw == null || String(raw).trim() === '') return undefined
+          const s = String(raw).trim().toLowerCase()
+          return s === 'low' || s === 'high' || s === 'off' ? s : undefined
+        })()
+        const tFromPatch =
+          mergeId === id &&
+          mergeHint?.think &&
+          (mergeHint.think === 'low' || mergeHint.think === 'high' || mergeHint.think === 'off')
+            ? mergeHint.think
+            : undefined
+        const think =
+          thinkFromApi !== undefined ? thinkFromApi : tFromPatch !== undefined ? tFromPatch : prev?.think
+
         return {
           id,
           key: session.key,
@@ -509,7 +536,7 @@ export function useAppState() {
             session.displayName?.trim() ||
             session.key,
           state: mapSessionState('idle'),
-          createdAt: deriveCreatedAtForSession(session, prevById.get(id)),
+          createdAt: deriveCreatedAtForSession(session, prev),
           updatedAt,
           ageMs: session.ageMs,
           model: session.model,
@@ -517,21 +544,25 @@ export function useAppState() {
           totalTokens: session.totalTokens,
           contextTokens: session.contextTokens,
           kind: session.kind,
+          verbose,
+          think,
         }
       })
       .sort(sortSessionsByCreatedDesc)
 
     const nextActiveId =
-      preferredSessionId && mappedSessions.some((session) => session.id === preferredSessionId)
-        ? preferredSessionId
-        : mappedSessions[0]?.id ?? state.activeSessionId
+      mappedSessions.length === 0
+        ? ''
+        : preferredSessionId && mappedSessions.some((session) => session.id === preferredSessionId)
+          ? preferredSessionId
+          : mappedSessions[0]!.id
 
     const normalizedSessions = mappedSessions.map((session) => ({
       ...session,
       state: session.id === nextActiveId ? mapSessionState('active') : session.state,
     }))
 
-    setSessions(normalizedSessions.length ? normalizedSessions : mockSessions)
+    setSessions(normalizedSessions)
     setState((prev) => ({
       ...prev,
       sessionListStatus: normalizedSessions.length ? 'loaded' : 'empty',
@@ -542,6 +573,7 @@ export function useAppState() {
   }
 
   async function refreshHistory(sessionId: string, mode: 'replace' | 'merge-tail' = 'replace') {
+    if (!sessionId) return
     if (mode === 'replace') {
       setState((prev) => ({
         ...prev,
@@ -743,13 +775,7 @@ export function useAppState() {
   useEffect(() => {
     void (async () => {
       try {
-        const [_, statusResult] = await Promise.all([refreshSessions(), fetchStatus()])
-
-        setStatusSummary([
-          'Host: Dan-MacBook',
-          `Gateway: ${statusResult.ok ? 'online' : 'unknown'}`,
-          `Sessions: ${statusResult.sessions?.count ?? 0}`,
-        ])
+        await Promise.all([refreshSessions(), fetchStatus()])
 
         setState((prev) => ({
           ...prev,
@@ -1099,13 +1125,20 @@ export function useAppState() {
   }, [sessions, state.sessionSearch])
 
   const activeSession = useMemo<SessionItem>(() => {
-    return (
+    const match =
       filteredSessions.find((session) => session.id === state.activeSessionId) ??
-      sessions.find((session) => session.id === state.activeSessionId) ??
-      sessions[0] ??
-      mockSessions[0]
-    )
-  }, [filteredSessions, sessions, state.activeSessionId])
+      sessions.find((session) => session.id === state.activeSessionId)
+    if (match) return match
+
+    const idle: SessionItem = { id: '', summary: '', state: 'idle' }
+    if (state.sessionListStatus === 'loading') {
+      return { ...idle, summary: '正在加载会话列表…' }
+    }
+    if (state.sessionListStatus === 'error') {
+      return { ...idle, summary: '会话列表加载失败' }
+    }
+    return { ...idle, summary: '暂无会话，请新建会话' }
+  }, [filteredSessions, sessions, state.activeSessionId, state.sessionListStatus])
 
   const currentDraft = state.draftBySession[state.activeSessionId] ?? ''
 
@@ -1125,6 +1158,37 @@ export function useAppState() {
       ),
     [displayMessages],
   )
+
+  const sideCards = useMemo((): SideCard[] => {
+    const tokenLine = formatContextUsageLine(activeSession.contextTokens, activeSession.totalTokens)
+    const summaryLine =
+      activeSession.summary.length > 52 ? `${activeSession.summary.slice(0, 52)}…` : activeSession.summary
+    const sessionItems = [
+      `ID: ${activeSession.id}`,
+      summaryLine,
+      `State: ${activeSession.state}`,
+      `Messages (thread): ${displayMessages.length}`,
+      ...(tokenLine ? [tokenLine] : []),
+    ]
+    const runtimeItems = [
+      'Host: Dan-MacBook',
+      `Gateway: ${state.connectionStatus}`,
+      `Sessions: ${sessions.length}`,
+    ]
+    return [
+      { title: '当前会话', items: sessionItems },
+      { title: '运行状态', items: runtimeItems },
+    ]
+  }, [
+    activeSession.contextTokens,
+    activeSession.id,
+    activeSession.state,
+    activeSession.summary,
+    activeSession.totalTokens,
+    displayMessages.length,
+    sessions.length,
+    state.connectionStatus,
+  ])
 
   /** 网关先报 completed 时气泡可能仍为 running；等无 running 后再清计时起点并写入 lastRunDurationMs */
   useEffect(() => {
@@ -1157,6 +1221,8 @@ export function useAppState() {
     }
 
     const sessionId = state.activeSessionId
+    if (!sessionId) return
+
     const optimisticMessageId = `local-user-${Date.now()}`
     const optimisticTimestamp = new Date().toISOString()
     const optimisticMessage: ApiMessage = {
@@ -1297,6 +1363,7 @@ export function useAppState() {
   }
 
   async function stopCurrentRun() {
+    if (!state.activeSessionId) return
     try {
       setState((prev) => ({ ...prev, composerError: undefined, runtimeNote: 'stopping' }))
       await abortSessionRun(state.activeSessionId)
@@ -1346,6 +1413,68 @@ export function useAppState() {
         composerError: error instanceof Error ? error.message : 'create_session_failed',
         runtimeNote: 'create session failed',
       }))
+    }
+  }
+
+  /** Context 面板：合并写入 label / model 等，底层与 rename 相同走网关 sessions.patch */
+  function sessionPatchHasPayload(patch: SessionPatchPayload) {
+    if (typeof patch.verbose === 'boolean') return true
+    if (patch.think != null && String(patch.think).trim() !== '') return true
+    return ['label', 'model', 'modelProvider'].some((k) => {
+      const v = patch[k as keyof SessionPatchPayload]
+      return v != null && String(v).trim() !== ''
+    })
+  }
+
+  async function patchActiveSessionSettings(patch: SessionPatchPayload) {
+    const sessionId = activeSessionIdRef.current
+    if (!sessionId || !sessionPatchHasPayload(patch)) return
+
+    try {
+      if (typeof patch.label === 'string' && patch.label.trim() !== '') {
+        manuallyTitledSessionIdsRef.current.add(sessionId)
+        autoTitledSessionIdsRef.current.add(sessionId)
+      }
+      await patchSessionSettings(sessionId, patch)
+      const mergeHint: { sessionId: string; verbose?: boolean; think?: 'low' | 'high' | 'off' } = {
+        sessionId,
+      }
+      if (typeof patch.verbose === 'boolean') mergeHint.verbose = patch.verbose
+      const tk = patch.think != null ? String(patch.think).trim().toLowerCase() : ''
+      if (tk === 'low' || tk === 'high' || tk === 'off') mergeHint.think = tk
+      await refreshSessions(sessionId, mergeHint)
+      setState((prev) => ({
+        ...prev,
+        runtimeNote: 'session updated',
+        composerError: undefined,
+      }))
+    } catch (error) {
+      setState((prev) => ({
+        ...prev,
+        runtimeNote: 'session patch failed',
+      }))
+      throw error
+    }
+  }
+
+  async function compactActiveSession() {
+    const sessionId = activeSessionIdRef.current
+    if (!sessionId) return
+    try {
+      await compactSession(sessionId)
+      await refreshHistory(sessionId, 'replace')
+      await refreshSessions(sessionId)
+      setState((prev) => ({
+        ...prev,
+        runtimeNote: 'compact done',
+        composerError: undefined,
+      }))
+    } catch (error) {
+      setState((prev) => ({
+        ...prev,
+        runtimeNote: 'compact failed',
+      }))
+      throw error
     }
   }
 
@@ -1409,12 +1538,7 @@ export function useAppState() {
     currentDraft,
     messages: displayMessages,
     modelSideStreaming,
-    sideCards: [
-      mockSideCards[0],
-      { ...mockSideCards[1], items: statusSummary },
-      mockSideCards[2],
-      mockSideCards[3],
-    ],
+    sideCards,
     setSessionSearch: (value: string) => setState((prev) => ({ ...prev, sessionSearch: value })),
     selectSession: (id: string) => {
       setSessions((current) => touchSessionState(current, id, 'active'))
@@ -1458,10 +1582,16 @@ export function useAppState() {
       })),
     sendCurrentMessage,
     stopCurrentRun,
-    refreshHistory: () => void refreshHistory(state.activeSessionId, 'replace'),
+    refreshHistory: () => {
+      const id = state.activeSessionId
+      if (!id) return
+      void refreshHistory(id, 'replace')
+    },
     loadOlderHistory,
     createNewSession,
     commitRenameSession,
+    patchActiveSessionSettings,
+    compactActiveSession,
     removeSession,
   }
 }

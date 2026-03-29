@@ -86,7 +86,31 @@ function parseHistoryBeforeFromQuery(query) {
 
 app.use(express.json())
 
+function normalizeSessionBool(value) {
+  if (value === true || value === false) return value
+  if (value === 'true' || value === 1) return true
+  if (value === 'false' || value === 0) return false
+  return undefined
+}
+
+/** Web 仅使用 low | high | off；从网关 think / thinkLevel / thinking* 等映射 */
+function normalizeSessionThinkLevel(raw) {
+  if (raw == null || raw === '') return undefined
+  const s = String(raw).trim().toLowerCase().replace(/-/g, '_')
+  if (['low', 'minimal', 'min', 'small'].includes(s)) return 'low'
+  if (['high', 'xhigh', 'max', 'maximum', 'heavy'].includes(s)) return 'high'
+  if (['off', 'none', 'no', 'disabled', 'false', '0'].includes(s)) return 'off'
+  if (['low', 'high', 'off'].includes(s)) return s
+  return undefined
+}
+
 function normalizeSession(item) {
+  const thinkRaw = item.think ?? item.thinkLevel ?? item.thinking ?? item.thinkingLevel
+  const think = normalizeSessionThinkLevel(thinkRaw)
+  const verbose =
+    normalizeSessionBool(item.verbose) ??
+    normalizeSessionBool(item.verboseEnabled) ??
+    normalizeSessionBool(item.isVerbose)
   return {
     key: item.key,
     sessionId: item.sessionId,
@@ -100,6 +124,204 @@ function normalizeSession(item) {
     kind: item.kind,
     label: item.label,
     displayName: item.displayName,
+    verbose,
+    think,
+  }
+}
+
+/** `provider/model` → { modelProvider, model } */
+function splitProviderFromId(fullId) {
+  const s = String(fullId ?? '').trim()
+  const i = s.indexOf('/')
+  if (i <= 0) return { modelProvider: undefined, model: s }
+  return { modelProvider: s.slice(0, i), model: s.slice(i + 1) }
+}
+
+/**
+ * 统一为 Web 使用的条目：id、model、name、可选 modelProvider（与 openclaw models list --json 等对齐）。
+ * 字符串视为完整 id（如 openai/gpt-4o）。
+ */
+function normalizeModelCatalogEntry(item) {
+  if (typeof item === 'string') {
+    const id = item.trim()
+    if (!id) return null
+    const sp = splitProviderFromId(id)
+    return {
+      id,
+      model: sp.model,
+      name: id,
+      label: id,
+      ...(sp.modelProvider ? { modelProvider: sp.modelProvider } : {}),
+    }
+  }
+  if (!item || typeof item !== 'object') return null
+
+  const prov = item.modelProvider ?? item.provider ?? item.vendor
+  const modOnly = item.model != null && String(item.model).trim() !== '' ? String(item.model).trim() : null
+
+  let id =
+    item.key != null && String(item.key).trim() !== ''
+      ? String(item.key).trim()
+      : item.id != null && String(item.id).trim() !== ''
+        ? String(item.id).trim()
+        : null
+
+  if (!id && modOnly && prov) id = `${String(prov).trim()}/${modOnly}`
+  if (!id && modOnly) id = modOnly
+  if (!id) return null
+
+  const sp = splitProviderFromId(id)
+  const name = String(item.name ?? item.label ?? item.displayName ?? id)
+
+  const out = {
+    id,
+    model: sp.model,
+    name,
+    label: name,
+    ...(sp.modelProvider ? { modelProvider: sp.modelProvider } : {}),
+  }
+  if (typeof item.available === 'boolean') out.available = item.available
+  if (Array.isArray(item.tags)) out.tags = item.tags
+  return out
+}
+
+function normalizeModelsArray(arr) {
+  if (!Array.isArray(arr)) return []
+  const out = []
+  const seen = new Set()
+  for (const item of arr) {
+    const m = normalizeModelCatalogEntry(item)
+    if (m && !seen.has(m.id)) {
+      seen.add(m.id)
+      out.push(m)
+    }
+  }
+  return out
+}
+
+function extractModelsFromStatusLike(obj) {
+  if (!obj || typeof obj !== 'object') return []
+  const tryArrays = [
+    obj.models,
+    obj.configuredModels,
+    obj.allowedModels,
+    obj.availableModels,
+    obj.modelCatalog,
+    obj.modelChoices,
+    obj.config?.models,
+    obj.runtime?.models,
+    obj.gateway?.models,
+    obj.agent?.models,
+  ]
+  for (const a of tryArrays) {
+    const list = normalizeModelsArray(a)
+    if (list.length) return list
+  }
+  if (obj.agents && typeof obj.agents === 'object' && !Array.isArray(obj.agents)) {
+    for (const k of Object.keys(obj.agents)) {
+      const agent = obj.agents[k]
+      if (agent && typeof agent === 'object') {
+        const list = normalizeModelsArray(agent.models)
+        if (list.length) return list
+      }
+    }
+  }
+  return []
+}
+
+function parseModelsListCliResponse(raw, sourceLabel) {
+  if (!raw || typeof raw !== 'object') return null
+  const arr = Array.isArray(raw) ? raw : raw.models
+  if (!Array.isArray(arr) || arr.length === 0) return null
+  const models = normalizeModelsArray(arr)
+  return models.length
+    ? {
+        source: sourceLabel,
+        models,
+        defaultModel: raw.defaultModel ?? raw.resolvedDefault,
+        count: raw.count,
+      }
+    : null
+}
+
+function parseModelsStatusCliResponse(raw, sourceLabel) {
+  if (!raw || typeof raw !== 'object') return null
+  const allowed = raw.allowed
+  if (!Array.isArray(allowed) || allowed.length === 0) return null
+  const models = normalizeModelsArray(allowed)
+  return models.length
+    ? {
+        source: sourceLabel,
+        models,
+        defaultModel: raw.defaultModel ?? raw.resolvedDefault,
+        fallbacks: raw.fallbacks,
+        aliases: raw.aliases,
+      }
+    : null
+}
+
+/**
+ * 按约定顺序探测 CLI（与 OpenClaw 文档对齐；随 CLI 演进可调整顺序）：
+ * 1) status --json 内嵌模型数组（未来由 OpenClaw 提供）
+ * 2) models list --json
+ * 3) model list --json
+ * 4) models status --json / models --status-json
+ */
+async function loadModelsCatalogPayload() {
+  const attempts = [
+    {
+      label: 'openclaw status --json',
+      run: async () => {
+        const raw = await runOpenClawJson(['status', '--json'])
+        const list = extractModelsFromStatusLike(raw)
+        return list.length ? { source: 'openclaw status --json', models: list } : null
+      },
+    },
+    {
+      label: 'openclaw models list --json',
+      run: async () => parseModelsListCliResponse(await runOpenClawJson(['models', 'list', '--json']), 'openclaw models list --json'),
+    },
+    {
+      label: 'openclaw model list --json',
+      run: async () => parseModelsListCliResponse(await runOpenClawJson(['model', 'list', '--json']), 'openclaw model list --json'),
+    },
+    {
+      label: 'openclaw models status --json',
+      run: async () =>
+        parseModelsStatusCliResponse(await runOpenClawJson(['models', 'status', '--json']), 'openclaw models status --json'),
+    },
+    {
+      label: 'openclaw models --status-json',
+      run: async () =>
+        parseModelsStatusCliResponse(await runOpenClawJson(['models', '--status-json']), 'openclaw models --status-json'),
+    },
+  ]
+
+  let lastError
+  for (const { label, run } of attempts) {
+    try {
+      const r = await run()
+      if (r?.models?.length) {
+        return {
+          schemaVersion: 1,
+          source: r.source,
+          models: r.models,
+          ...(r.defaultModel != null ? { defaultModel: r.defaultModel } : {}),
+          ...(r.fallbacks != null ? { fallbacks: r.fallbacks } : {}),
+          ...(r.aliases != null ? { aliases: r.aliases } : {}),
+          ...(r.count != null ? { count: r.count } : {}),
+        }
+      }
+    } catch (e) {
+      lastError = e
+    }
+  }
+
+  return {
+    schemaVersion: 1,
+    source: 'empty',
+    models: [],
+    ...(lastError instanceof Error ? { error: lastError.message, lastAttemptNote: '所有 CLI 探测均未返回非空模型列表' } : {}),
   }
 }
 
@@ -1204,6 +1426,19 @@ app.get('/api/status', async (_req, res) => {
   }
 })
 
+app.get('/api/models', async (_req, res) => {
+  try {
+    const payload = await loadModelsCatalogPayload()
+    res.json(payload)
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'models_failed',
+      source: 'error',
+      models: [],
+    })
+  }
+})
+
 /** 斜杠命令补全列表；见 docs/web-console-slash-commands-contract.md */
 const DEFAULT_SLASH_FALLBACK = [
   { trigger: '/help', description: '显示帮助', showInWeb: true },
@@ -1408,6 +1643,216 @@ app.post('/api/sessions/:sessionId/label', async (req, res) => {
     res.status(code === 'session_not_found' ? 404 : 500).json({
       error: 'rename_session_failed',
       message: error instanceof Error ? error.message : 'rename_session_failed',
+    })
+  }
+})
+
+/** 透传网关 `sessions.patch`；白名单与 Web 一致；非法字段或类型返回 400 */
+const SESSION_PATCH_ALLOWED_KEYS = new Set(['label', 'model', 'modelProvider', 'verbose', 'think'])
+
+function buildSessionPatchPayloadStrict(body) {
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) {
+    return {
+      error: { status: 400, code: 'invalid_body', message: '请求体须为 JSON 对象' },
+    }
+  }
+  const keys = Object.keys(body)
+  const unknown = keys.filter((k) => !SESSION_PATCH_ALLOWED_KEYS.has(k))
+  if (unknown.length) {
+    return {
+      error: {
+        status: 400,
+        code: 'unknown_fields',
+        message: `不支持的字段：${unknown.join(', ')}。仅允许：${[...SESSION_PATCH_ALLOWED_KEYS].join(', ')}`,
+      },
+    }
+  }
+
+  if (body.verbose !== undefined && body.verbose !== null && typeof body.verbose !== 'boolean') {
+    return {
+      error: { status: 400, code: 'invalid_verbose', message: 'verbose 必须为布尔类型（true / false）' },
+    }
+  }
+
+  if (body.think !== undefined && body.think !== null && String(body.think).trim() !== '') {
+    const t = String(body.think).trim().toLowerCase()
+    if (t !== 'low' && t !== 'high' && t !== 'off') {
+      return {
+        error: { status: 400, code: 'invalid_think', message: 'think 仅允许 low、high、off' },
+      }
+    }
+  }
+
+  const out = {}
+  for (const k of ['label', 'model', 'modelProvider']) {
+    if (body[k] == null) continue
+    const v = String(body[k]).trim()
+    if (v !== '') out[k] = v
+  }
+  if (body.verbose === true || body.verbose === false) out.verbose = body.verbose
+  if (body.think != null && String(body.think).trim() !== '') {
+    out.think = String(body.think).trim().toLowerCase()
+  }
+
+  if (Object.keys(out).length === 0) {
+    return {
+      error: {
+        status: 400,
+        code: 'empty_patch',
+        message: '至少需要一项有效更新：label / model / modelProvider / verbose / think',
+      },
+    }
+  }
+
+  return { patch: out }
+}
+
+/**
+ * 网关 sessions.patch 仅支持部分字段（如 label、model）；verbose / think 需走 TUI 同款斜杠命令。
+ */
+function splitPatchForGateway(patch) {
+  const core = {}
+  if (patch.label != null && String(patch.label).trim() !== '') core.label = String(patch.label).trim()
+  if (patch.model != null && String(patch.model).trim() !== '') core.model = String(patch.model).trim()
+  if (patch.modelProvider != null && String(patch.modelProvider).trim() !== '')
+    core.modelProvider = String(patch.modelProvider).trim()
+
+  const slashMessages = []
+  if (patch.verbose === true) slashMessages.push('/verbose on')
+  if (patch.verbose === false) slashMessages.push('/verbose off')
+  if (patch.think != null && String(patch.think).trim() !== '') {
+    const t = String(patch.think).trim().toLowerCase()
+    if (t === 'low' || t === 'high' || t === 'off') slashMessages.push(`/thinking ${t}`)
+  }
+  return { core, slashMessages }
+}
+
+function gatewaySessionPatchParams(sessionKey, core) {
+  return { key: sessionKey, ...core }
+}
+
+function isLikelyUnsupportedGatewayMethodError(error) {
+  const m = (error instanceof Error ? error.message : String(error)).toLowerCase()
+  return (
+    m.includes('unknown') ||
+    m.includes('not found') ||
+    m.includes('unsupported') ||
+    m.includes('invalid method') ||
+    m.includes('no such method') ||
+    m.includes('method_not_found') ||
+    m.includes('404')
+  )
+}
+
+/**
+ * 优先独立 RPC（历史无 /compact 用户消息）；失败则回退 chat.send「/compact」。
+ * OPENCLAW_COMPACT_METHOD=auto|sessions.compact|chat.compact|slash
+ */
+async function runCompactForSession(sessionKey) {
+  const mode = (process.env.OPENCLAW_COMPACT_METHOD ?? 'auto').trim().toLowerCase()
+
+  if (mode === 'slash' || mode === 'chat.send') {
+    const result = await runGatewayCall(
+      'chat.send',
+      { sessionKey, message: '/compact', idempotencyKey: crypto.randomUUID() },
+      60000,
+    )
+    return { via: 'chat.send:/compact', result }
+  }
+
+  const tryRpc = []
+  if (mode === 'sessions.compact') tryRpc.push('sessions.compact')
+  else if (mode === 'chat.compact') tryRpc.push('chat.compact')
+  else {
+    tryRpc.push('sessions.compact', 'chat.compact')
+  }
+
+  let lastErr
+  for (const method of tryRpc) {
+    try {
+      const result = await runGatewayCall(method, { sessionKey }, 60000)
+      return { via: method, result }
+    } catch (e) {
+      lastErr = e
+      if (mode !== 'auto' && tryRpc.length === 1) throw e
+      if (!isLikelyUnsupportedGatewayMethodError(e)) throw e
+    }
+  }
+
+  if (mode !== 'auto' && tryRpc.length > 0) {
+    throw lastErr ?? new Error('compact_rpc_failed')
+  }
+
+  const result = await runGatewayCall(
+    'chat.send',
+    { sessionKey, message: '/compact', idempotencyKey: crypto.randomUUID() },
+    60000,
+  )
+  return { via: 'chat.send:/compact', result }
+}
+
+app.post('/api/sessions/:sessionId/patch', async (req, res) => {
+  const built = buildSessionPatchPayloadStrict(req.body)
+  if (built.error) {
+    return res.status(built.error.status).json({
+      error: built.error.code,
+      message: built.error.message,
+    })
+  }
+
+  try {
+    const session = await resolveSession(req.params.sessionId)
+    const { core, slashMessages } = splitPatchForGateway(built.patch)
+
+    let result
+    if (Object.keys(core).length > 0) {
+      result = await runGatewayCall('sessions.patch', gatewaySessionPatchParams(session.key, core))
+    }
+    for (const message of slashMessages) {
+      result = await runGatewayCall(
+        'chat.send',
+        { sessionKey: session.key, message, idempotencyKey: crypto.randomUUID() },
+        60000,
+      )
+      invalidateHistoryCacheForSessionKey(session.key)
+    }
+
+    invalidateSessionsListCache()
+    res.json({
+      ok: true,
+      sessionKey: session.key,
+      patch: built.patch,
+      applied: {
+        sessionsPatch: Object.keys(core).length > 0 ? core : undefined,
+        slashMessages: slashMessages.length ? slashMessages : undefined,
+      },
+      result,
+    })
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error ? error.code : undefined
+    res.status(code === 'session_not_found' ? 404 : 500).json({
+      error: 'session_patch_failed',
+      message: error instanceof Error ? error.message : 'session_patch_failed',
+    })
+  }
+})
+
+/**
+ * compact：默认依次尝试 sessions.compact、chat.compact，不支持则 chat.send「/compact」。
+ * 环境变量 OPENCLAW_COMPACT_METHOD=auto|sessions.compact|chat.compact|slash
+ */
+app.post('/api/sessions/:sessionId/compact', async (req, res) => {
+  try {
+    const session = await resolveSession(req.params.sessionId)
+    const { via, result } = await runCompactForSession(session.key)
+    invalidateHistoryCacheForSessionKey(session.key)
+    invalidateSessionsListCache()
+    res.json({ ok: true, sessionKey: session.key, via, result })
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error ? error.code : undefined
+    res.status(code === 'session_not_found' ? 404 : 500).json({
+      error: 'compact_failed',
+      message: error instanceof Error ? error.message : 'compact_failed',
     })
   }
 })

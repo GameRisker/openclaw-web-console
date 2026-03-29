@@ -45,6 +45,10 @@ export interface SessionItem {
   totalTokens?: number
   contextTokens?: number
   kind?: string
+  /** 来自 sessions.list（若网关提供） */
+  verbose?: boolean
+  /** think 档位：low | high | off */
+  think?: string
 }
 
 export interface SideCard {

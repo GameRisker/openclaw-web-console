@@ -42,6 +42,52 @@ export async function fetchStatus() {
   return response.json()
 }
 
+export type ModelCatalogEntry = {
+  id: string
+  label: string
+  name?: string
+  model?: string
+  modelProvider?: string
+  available?: boolean
+  tags?: string[]
+}
+
+export async function fetchModelsCatalog(): Promise<{
+  models: ModelCatalogEntry[]
+  source?: string
+  schemaVersion?: number
+  defaultModel?: string
+  fallbacks?: unknown
+  aliases?: unknown
+  count?: number
+  error?: string
+}> {
+  const response = await fetch('/api/models')
+  const data = (await response.json()) as {
+    models?: ModelCatalogEntry[]
+    source?: string
+    schemaVersion?: number
+    defaultModel?: string
+    fallbacks?: unknown
+    aliases?: unknown
+    count?: number
+    error?: string
+  }
+  if (!response.ok) {
+    throw new Error(data.error || 'failed_to_fetch_models')
+  }
+  return {
+    models: Array.isArray(data.models) ? data.models : [],
+    source: data.source,
+    schemaVersion: data.schemaVersion,
+    defaultModel: typeof data.defaultModel === 'string' ? data.defaultModel : undefined,
+    fallbacks: data.fallbacks,
+    aliases: data.aliases,
+    count: typeof data.count === 'number' ? data.count : undefined,
+    error: data.error,
+  }
+}
+
 export async function sendSessionMessage(
   sessionId: string,
   message: string,
@@ -127,5 +173,41 @@ export async function renameSession(sessionId: string, label: string) {
 
   const result = await response.json()
   if (!response.ok) throw new Error(result.message || result.error || 'rename_session_failed')
+  return result
+}
+
+export type SessionPatchPayload = {
+  label?: string
+  model?: string
+  modelProvider?: string
+  verbose?: boolean
+  think?: string
+}
+
+export async function patchSessionSettings(sessionId: string, patch: SessionPatchPayload) {
+  const response = await fetch(`/api/sessions/${sessionId}/patch`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(patch),
+  })
+
+  const result = await response.json()
+  if (!response.ok) throw new Error(result.message || result.error || 'session_patch_failed')
+  return result as { ok?: boolean; patch?: SessionPatchPayload }
+}
+
+export async function compactSession(sessionId: string) {
+  const response = await fetch(`/api/sessions/${sessionId}/compact`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({}),
+  })
+
+  const result = await response.json()
+  if (!response.ok) throw new Error(result.message || result.error || 'compact_failed')
   return result
 }
