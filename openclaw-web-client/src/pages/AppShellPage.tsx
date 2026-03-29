@@ -1,10 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { useAppState } from '../state/useAppState'
 import { openclawWebLog } from '../state/debugLog'
 import { isUserFacingRole } from '../utils/roles'
+import type { ApiMessage } from '../types/api'
 
 function getConnectionPillClass(status: string) {
   if (status === 'connected') return 'success'
@@ -50,6 +51,232 @@ function renderMessageHeaderLabel(message: { kind?: string; role?: string; label
   if (message.kind === 'toolResult' || message.role === 'toolResult') return message.label || message.toolName || 'Tool Result'
   if (message.kind === 'verbose' || message.role === 'verbose') return message.label || 'Verbose'
   return undefined
+}
+
+type MessageKindVariant = 'user' | 'assistant' | 'verbose' | 'toolCall' | 'toolResult' | 'system' | 'muted'
+
+function messageKindVariantFromFlags(flags: {
+  isUser: boolean
+  isVerbose: boolean
+  isToolResult: boolean
+  isToolCall: boolean
+  isAssistant: boolean
+  isSystem: boolean
+}): MessageKindVariant {
+  if (flags.isUser) return 'user'
+  if (flags.isVerbose) return 'verbose'
+  if (flags.isToolResult) return 'toolResult'
+  if (flags.isToolCall) return 'toolCall'
+  if (flags.isAssistant) return 'assistant'
+  if (flags.isSystem) return 'system'
+  return 'muted'
+}
+
+function getMessageKindFlags(message: ApiMessage) {
+  const isUser = isUserFacingRole(message.role, message.kind)
+  const isVerbose =
+    message.kind === 'verbose' ||
+    message.role === 'verbose' ||
+    message.content.includes('[thinking]') ||
+    message.content.includes('[reasoning]')
+  const isToolResult =
+    message.kind === 'toolResult' || message.role === 'toolResult' || message.content.includes('[toolResult]')
+  const isToolCall =
+    !isToolResult &&
+    (message.kind === 'toolCall' || message.role === 'tool' || message.content.includes('[toolCall]'))
+  const isTool = isToolCall || isToolResult
+  const isAssistant =
+    (message.kind === 'assistant' || message.role === 'assistant') && !isVerbose && !isTool
+  const isSystem = message.role === 'system' || message.kind === 'system'
+  return { isUser, isVerbose, isToolResult, isToolCall, isTool, isAssistant, isSystem }
+}
+
+/** Verbose / Tool / System 等非正文行：挂在下一条 Assistant 气泡上展示图标 */
+function variantForSidecarMessage(m: ApiMessage): MessageKindVariant {
+  const f = getMessageKindFlags(m)
+  return messageKindVariantFromFlags({
+    isUser: false,
+    isVerbose: f.isVerbose,
+    isToolResult: f.isToolResult,
+    isToolCall: f.isToolCall,
+    isAssistant: false,
+    isSystem: f.isSystem,
+  })
+}
+
+type ThreadDisplayRow =
+  | { kind: 'user'; message: ApiMessage }
+  | { kind: 'assistant'; message: ApiMessage; sidecars: ApiMessage[] }
+  | { kind: 'orphan-sidecars'; sidecars: ApiMessage[] }
+
+/**
+ * 按「用户消息」切段：每一段里，Verbose / Tool 等侧车**全部归到该段最后一条主 Assistant**，
+ * 这样无论网关顺序是「思考→工具→正文」还是「正文→工具回写」，图标都在**本轮最终那条主回复气泡**里。
+ */
+function buildThreadDisplayList(messages: ApiMessage[]): ThreadDisplayRow[] {
+  const rows: ThreadDisplayRow[] = []
+  let i = 0
+
+  while (i < messages.length) {
+    const f = getMessageKindFlags(messages[i])
+    if (f.isUser) {
+      rows.push({ kind: 'user', message: messages[i] })
+      i++
+      continue
+    }
+
+    const segment: ApiMessage[] = []
+    while (i < messages.length && !getMessageKindFlags(messages[i]).isUser) {
+      segment.push(messages[i])
+      i++
+    }
+
+    const assistantsInOrder = segment.filter((msg) => getMessageKindFlags(msg).isAssistant)
+    const sidecars = segment.filter((msg) => !getMessageKindFlags(msg).isAssistant)
+
+    if (assistantsInOrder.length === 0) {
+      if (sidecars.length > 0) {
+        rows.push({ kind: 'orphan-sidecars', sidecars })
+      }
+      continue
+    }
+
+    const lastAi = assistantsInOrder.length - 1
+    for (let j = 0; j < assistantsInOrder.length; j++) {
+      rows.push({
+        kind: 'assistant',
+        message: assistantsInOrder[j],
+        sidecars: j === lastAi ? sidecars : [],
+      })
+    }
+  }
+
+  return rows
+}
+
+function messageKindPanelTitle(variant: MessageKindVariant, headerLabel: string | undefined): string {
+  const h = headerLabel?.trim()
+  switch (variant) {
+    case 'user':
+      return '用户消息'
+    case 'assistant':
+      return 'Assistant'
+    case 'verbose':
+      return h ? `Verbose · ${h}` : 'Verbose（思考/推理）'
+    case 'toolCall':
+      return h ? `Tool Call · ${h}` : 'Tool Call'
+    case 'toolResult':
+      return h ? `Tool Result · ${h}` : 'Tool Result'
+    case 'system':
+      return 'System'
+    default:
+      return '消息'
+  }
+}
+
+function KindIcon({ variant }: { variant: MessageKindVariant }) {
+  const svgProps = {
+    className: 'message-kind-icon-svg',
+    viewBox: '0 0 24 24' as const,
+    fill: 'none' as const,
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true as const,
+  }
+  switch (variant) {
+    case 'user':
+      return (
+        <svg {...svgProps}>
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+          <circle cx="12" cy="7" r="4" />
+        </svg>
+      )
+    case 'assistant':
+      return (
+        <svg {...svgProps}>
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        </svg>
+      )
+    case 'verbose':
+      return (
+        <svg {...svgProps}>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" />
+        </svg>
+      )
+    case 'toolCall':
+      return (
+        <svg {...svgProps}>
+          <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+        </svg>
+      )
+    case 'toolResult':
+      return (
+        <svg {...svgProps}>
+          <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+          <polyline points="22 4 12 14.01 9 11.01" />
+        </svg>
+      )
+    case 'system':
+      return (
+        <svg {...svgProps}>
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="16" x2="12" y2="12" />
+          <line x1="12" y1="8" x2="12.01" y2="8" />
+        </svg>
+      )
+    default:
+      return (
+        <svg {...svgProps}>
+          <circle cx="12" cy="12" r="10" />
+        </svg>
+      )
+  }
+}
+
+function MessageKindIconBadge({
+  variant,
+  panelTitle,
+  bodyText,
+}: {
+  variant: MessageKindVariant
+  panelTitle: string
+  bodyText: string
+}) {
+  const text = bodyText.trim() || '（空内容）'
+  return (
+    <div className="message-kind-badge">
+      <button type="button" className="message-kind-badge-trigger" aria-label={`类型与全文：${panelTitle}`}>
+        <KindIcon variant={variant} />
+      </button>
+      <div className="message-kind-badge-panel" role="tooltip">
+        <div className="message-kind-badge-panel-title">{panelTitle}</div>
+        <pre className="message-kind-badge-panel-body">{text}</pre>
+      </div>
+    </div>
+  )
+}
+
+function MessageKindIconStrip({ sidecars, embedded }: { sidecars: ApiMessage[]; embedded?: boolean }) {
+  if (sidecars.length === 0) return null
+  return (
+    <div className={embedded ? 'message-kind-strip message-kind-strip--embedded' : 'message-kind-strip'}>
+      {sidecars.map((sm) => {
+        const v = variantForSidecarMessage(sm)
+        const hl = renderMessageHeaderLabel(sm)
+        return (
+          <MessageKindIconBadge
+            key={sm.id}
+            variant={v}
+            panelTitle={messageKindPanelTitle(v, hl)}
+            bodyText={sm.content ?? ''}
+          />
+        )
+      })}
+    </div>
+  )
 }
 
 function formatElapsed(ms: number) {
@@ -195,18 +422,27 @@ export function AppShellPage() {
 
   const visibleMessages = messages
 
+  const threadDisplayRows = useMemo(() => buildThreadDisplayList(visibleMessages), [visibleMessages])
+
+  const { lastUserMessageId, lastRunningMessageId } = useMemo(() => {
+    let u: string | undefined
+    let r: string | undefined
+    for (let i = visibleMessages.length - 1; i >= 0; i--) {
+      const m = visibleMessages[i]
+      if (u === undefined && isUserFacingRole(m.role, m.kind)) u = m.id
+      if (r === undefined && m.runStatus === 'running') r = m.id
+      if (u !== undefined && r !== undefined) break
+    }
+    return { lastUserMessageId: u, lastRunningMessageId: r }
+  }, [visibleMessages])
+
+  const anyRunningInThread = lastRunningMessageId != null
+
   const awaitingAssistantReply =
     state.sendStatus === 'sending' ||
     state.sendStatus === 'queued' ||
     state.sendStatus === 'waiting-response' ||
     (state.sendStatus === 'completed' && modelSideStreaming)
-
-  let lastUserMessageIndex = -1
-  visibleMessages.forEach((m, i) => {
-    if (isUserFacingRole(m.role, m.kind)) lastUserMessageIndex = i
-  })
-  const lastRunningIndex = visibleMessages.map((m) => m.runStatus).lastIndexOf('running')
-  const anyRunningInThread = lastRunningIndex >= 0
 
   /** 与 waitElapsedMs 的 effect 一致：有进行中的轮次时在输入框状态栏显示计时 */
   const runTimerVisible =
@@ -532,57 +768,42 @@ export function AppShellPage() {
 
             {(state.historyStatus === 'ready' ||
               (state.historyStatus === 'loading-history' && visibleMessages.length > 0)) &&
-              visibleMessages.map((message, index) => {
-                const isUser = isUserFacingRole(message.role, message.kind)
-                const isVerbose = message.kind === 'verbose' || message.role === 'verbose' || message.content.includes('[thinking]') || message.content.includes('[reasoning]')
-                const isTool = message.kind === 'toolCall' || message.kind === 'toolResult' || message.role === 'tool' || message.role === 'toolResult' || message.content.includes('[toolCall]') || message.content.includes('[toolResult]')
-                const isAssistant = (message.kind === 'assistant' || message.role === 'assistant') && !isVerbose && !isTool
-                const isSystem = message.role === 'system' || message.kind === 'system'
+              threadDisplayRows.map((row) => {
+                if (row.kind === 'orphan-sidecars') {
+                  return (
+                    <article
+                      key={`orphan-${row.sidecars.map((s) => s.id).join('·')}`}
+                      className="message-row message-row--orphan-sidecars assistant"
+                    >
+                      <div className="message-card assistant message-card--orphan-icons-only">
+                        <MessageKindIconStrip sidecars={row.sidecars} embedded />
+                      </div>
+                    </article>
+                  )
+                }
+
+                const message = row.message
+                const isUser = row.kind === 'user'
+                const messageClass = isUser ? 'user' : 'assistant'
                 const headerLabel = renderMessageHeaderLabel(message)
-                const messageClass = isUser
-                  ? 'user'
-                  : isVerbose
-                    ? 'verbose'
-                    : isAssistant
-                      ? 'assistant'
-                      : isTool
-                        ? 'tool'
-                        : isSystem
-                          ? 'system'
-                          : 'muted'
+                const messageTimeMeta = formatMessageTimeMeta(message.timestamp)
 
                 const isLatestRunningMessage =
-                  message.runStatus === 'running' && index === lastRunningIndex
-                /** queued 时尚无 running 气泡，用户消息已被标为 completed，计时挂最后一条用户消息上 */
+                  message.runStatus === 'running' && message.id === lastRunningMessageId
                 const showWaitTimerOnUserTail =
                   awaitingAssistantReply &&
                   !anyRunningInThread &&
                   isUser &&
-                  index === lastUserMessageIndex &&
+                  message.id === lastUserMessageId &&
                   Boolean(state.currentRunStartedAt)
                 const showStreamingTimer = isLatestRunningMessage || showWaitTimerOnUserTail
-                const messageTimeMeta = formatMessageTimeMeta(message.timestamp)
 
                 return (
                   <article key={message.id} className={`message-row ${messageClass}`}>
                     <div className={`message-card ${messageClass} ${showStreamingTimer ? 'streaming' : ''}`}>
                       <div className="message-card-header">
                         <div className="message-card-header-main">
-                          <strong>
-                            {isUser
-                              ? 'You'
-                              : isVerbose
-                                ? 'Verbose'
-                                : isAssistant
-                                  ? 'Assistant'
-                                  : message.kind === 'toolResult' || message.role === 'toolResult'
-                                    ? 'Tool Result'
-                                    : isTool
-                                      ? 'Tool Call'
-                                      : isSystem
-                                        ? 'System'
-                                        : message.role}
-                          </strong>
+                          <strong>{isUser ? 'You' : 'Assistant'}</strong>
                           {headerLabel && <span className="message-header-label">{headerLabel}</span>}
                         </div>
                         {messageTimeMeta && (
@@ -601,6 +822,9 @@ export function AppShellPage() {
                           __html: renderMarkdown(message.content || '（空内容）'),
                         }}
                       />
+                      {!isUser && row.kind === 'assistant' && (
+                        <MessageKindIconStrip sidecars={row.sidecars} embedded />
+                      )}
                     </div>
                   </article>
                 )

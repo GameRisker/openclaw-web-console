@@ -692,6 +692,7 @@ textarea {
 
 /* 气泡：允许在窄列内收缩；勿 flex-shrink:0 + nowrap 祖先，否则用户消息会被挤出视口右侧 */
 .message-row .message-card {
+  position: relative;
   flex: 0 1 auto;
   width: fit-content;
   max-width: min(100%, 720px);
@@ -837,6 +838,135 @@ textarea {
   line-height: 1.5;
   color: #dbe7f5;
   font-size: 13px;
+}
+
+/* 类型图标：悬停/聚焦显示全文浮层 */
+.message-kind-strip {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+/* 嵌在气泡内：正文下方，与正文同起点 */
+.message-kind-strip--embedded {
+  margin-top: 4px;
+  margin-bottom: 0;
+  padding: 0;
+  border-top: none;
+  border-radius: 0;
+  background: transparent;
+  gap: 4px;
+  line-height: 0;
+}
+
+/* 含侧车图标条时略减气泡底部内边距，整体高度更贴正文+图标（不改图标尺寸） */
+.message-card.assistant:has(.message-kind-strip--embedded) {
+  padding-bottom: 6px;
+}
+
+/* 仅挂起侧车、尚无正文 Assistant：小气泡内只放图标 */
+.message-row.message-row--orphan-sidecars {
+  justify-content: flex-start;
+  width: 100%;
+}
+
+.message-card.message-card--orphan-icons-only {
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.message-kind-badge {
+  position: relative;
+  display: inline-flex;
+}
+
+.message-kind-badge-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  padding: 0;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: rgba(148, 163, 184, 0.75);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.message-kind-badge-trigger:hover {
+  color: #cbd5e1;
+  background: transparent;
+}
+
+.message-kind-badge-trigger:focus {
+  outline: none;
+}
+
+.message-kind-badge-trigger:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.55);
+  outline-offset: 2px;
+}
+
+.message-kind-icon-svg {
+  width: 11px;
+  height: 11px;
+  display: block;
+}
+
+.message-kind-badge-panel {
+  display: none;
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  min-width: 220px;
+  max-width: min(440px, 78vw);
+  max-height: min(320px, 45vh);
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(15, 23, 42, 0.98);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+  font-size: 11px;
+  color: #cbd5e1;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.message-row.user .message-kind-badge-panel {
+  left: auto;
+  right: 0;
+}
+
+.message-kind-badge:hover .message-kind-badge-panel,
+.message-kind-badge:focus-within .message-kind-badge-panel {
+  display: block;
+}
+
+.message-kind-badge-panel-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: #e2e8f0;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.message-kind-badge-panel-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.45;
+  color: rgba(203, 213, 225, 0.94);
 }
 
 .message-row.user .message-card-header,

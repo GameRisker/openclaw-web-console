@@ -240,8 +240,11 @@ function mergeSnapshotRenderItems(
     if (!userMessageContentMatches(inc.content, item.content)) return false
     const optMs = toTimestampMs(item.timestamp)
     const incMs = toTimestampMs(inc.timestamp)
-    if (optMs <= 0 || incMs <= 0) return false
-    return incMs >= optMs - 120_000
+    if (optMs > 0 && incMs > 0) {
+      return incMs >= optMs - 120_000
+    }
+    // 任一侧时间戳缺失时仍视为已回显，否则乐观气泡会与服务端用户行并存（双份 You）
+    return true
   }
 
   const pending = previous.filter((item) => {
@@ -304,6 +307,11 @@ function normalizeMessages(messages: ApiMessage[]) {
   }
 
   return merged
+}
+
+/** merge 后补 normalize：去掉已与网关回显重合的 local-user（指纹合并认不出「同句不同时间戳」） */
+function finalizeMergedMessages(merged: ApiMessage[]): ApiMessage[] {
+  return sortMessagesChronological(normalizeMessages(merged))
 }
 
 function sortMessagesChronological(messages: ApiMessage[]): ApiMessage[] {
@@ -510,11 +518,12 @@ export function useAppState() {
       const snapshot = getHistoryMergeBase(renderItemsRef.current, messagesRef.current)
       if (mode === 'merge-tail' && snapshot.length > 0) {
         const merged = mergeMessagesUniqueChronological(snapshot, normalized)
-        const renderMerged = toRenderItemsFromMessages(merged, sessionId)
-        setMessages(merged)
+        const final = finalizeMergedMessages(merged)
+        const renderMerged = toRenderItemsFromMessages(final, sessionId)
+        setMessages(final)
         setRenderItems((prev) => mergeSnapshotRenderItems(renderMerged, prev, sessionId))
         setState((prev) => {
-          const next = reconcileSendStatusAfterHistory({ ...prev, historyStatus: 'ready' }, merged)
+          const next = reconcileSendStatusAfterHistory({ ...prev, historyStatus: 'ready' }, final)
           return {
             ...next,
             composerError: undefined,
@@ -659,20 +668,21 @@ export function useAppState() {
         getHistoryMergeBase(renderItemsRef.current, messagesRef.current),
         normalized,
       )
+      const final = finalizeMergedMessages(merged)
       const serverHasMore = data.hasMore ?? normalized.length >= reqLimit
       const nextHasMore = newCount === 0 ? false : serverHasMore
 
       openclawWebLog('loadOlder done', {
-        mergedLen: merged.length,
+        mergedLen: final.length,
         newCount,
         reqLimit,
         nextHasMore,
         serverHasMore,
       })
 
-      setMessages(merged)
+      setMessages(final)
       setRenderItems((prev) =>
-        mergeSnapshotRenderItems(toRenderItemsFromMessages(merged, sessionId), prev, sessionId),
+        mergeSnapshotRenderItems(toRenderItemsFromMessages(final, sessionId), prev, sessionId),
       )
       setState((prev) => ({
         ...prev,
