@@ -99,6 +99,85 @@ function inferKind(message: ApiMessage): TimelineRenderItem['kind'] {
   return 'assistant'
 }
 
+/** Gateway may use completed/done/etc. instead of `final`; align with bridge canonicalization. */
+function classifyChatEventState(raw: string | undefined): 'final' | 'error' | 'delta' {
+  if (raw == null || raw === '') return 'delta'
+  const s = String(raw).toLowerCase().replace(/-/g, '_')
+  if (['final', 'complete', 'completed', 'done', 'success', 'finished', 'end', 'ok'].includes(s)) return 'final'
+  if (['error', 'failed', 'failure', 'cancelled', 'canceled'].includes(s)) return 'error'
+  return 'delta'
+}
+
+/**
+ * After history refresh: if we're still queued/waiting but the last user turn already has a non-running
+ * assistant reply, treat the run as settled (WS final/run.completed may never arrive for some gateways).
+ */
+function historyShowsTurnSettled(messages: ApiMessage[]): boolean {
+  if (messages.length === 0) return false
+  const sorted = [...messages].sort((a, b) => {
+    const d = toTimestampMs(a.timestamp) - toTimestampMs(b.timestamp)
+    return d !== 0 ? d : String(a.id).localeCompare(String(b.id))
+  })
+  let lastUserIdx = -1
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    if (isUserFacingRole(sorted[i].role, sorted[i].kind)) {
+      lastUserIdx = i
+      break
+    }
+  }
+  if (lastUserIdx < 0) return false
+  const afterUser = sorted.slice(lastUserIdx + 1)
+  if (afterUser.length === 0) return false
+  if (afterUser.some((m) => m.runStatus === 'running')) return false
+  return afterUser.some(
+    (m) => inferKind(m) === 'assistant' && String(m.content ?? '').trim().length > 0,
+  )
+}
+
+function reconcileSendStatusAfterHistory(prev: AppState, messages: ApiMessage[]): AppState {
+  if (prev.sendStatus !== 'queued' && prev.sendStatus !== 'waiting-response') return prev
+  if (messages.some((m) => m.runStatus === 'running')) return prev
+  if (!historyShowsTurnSettled(messages)) return prev
+  return {
+    ...prev,
+    sendStatus: 'completed',
+    toolActivityStatus: 'completed',
+    runtimeNote: 'completed',
+    currentRunStartedAt: undefined,
+    lastRunDurationMs: prev.currentRunStartedAt
+      ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+      : prev.lastRunDurationMs,
+  }
+}
+
+/** Timeline row may carry terminal `status` while upsert omits `runStatus` (bridge/gateway quirks). */
+function reconcileSendStatusFromAssistantRenderItem(
+  prev: AppState,
+  ri: TimelineRenderItem | undefined,
+): AppState {
+  if (!ri) return prev
+  if (ri.kind !== 'assistant') return prev
+  if (ri.status !== 'completed' && ri.status !== 'failed' && ri.status !== 'stopped') return prev
+  if (
+    prev.sendStatus !== 'waiting-response' &&
+    prev.sendStatus !== 'queued' &&
+    prev.sendStatus !== 'sending'
+  ) {
+    return prev
+  }
+  return {
+    ...prev,
+    sendStatus: ri.status === 'failed' ? 'error' : ri.status === 'stopped' ? 'stopped' : 'completed',
+    toolActivityStatus: ri.status === 'failed' ? 'failed' : ri.status === 'stopped' ? 'stopped' : 'completed',
+    runtimeNote:
+      ri.status === 'failed' ? 'run failed' : ri.status === 'stopped' ? 'stopped' : 'completed',
+    currentRunStartedAt: undefined,
+    lastRunDurationMs: prev.currentRunStartedAt
+      ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+      : prev.lastRunDurationMs,
+  }
+}
+
 function toRenderItemsFromMessages(messages: ApiMessage[], sessionId: string): TimelineRenderItem[] {
   return messages.map((message) => {
     const kind = inferKind(message)
@@ -323,7 +402,7 @@ export function useAppState() {
       setRenderItems((prev) =>
         mergeSnapshotRenderItems(toRenderItemsFromMessages(normalized, sessionId), prev, sessionId),
       )
-      setState((prev) => ({ ...prev, historyStatus: 'ready' }))
+      setState((prev) => reconcileSendStatusAfterHistory({ ...prev, historyStatus: 'ready' }, normalized))
     } catch {
       if (activeSessionIdRef.current !== sessionId) return
       setMessages([])
@@ -386,21 +465,47 @@ export function useAppState() {
         }
 
         if (event.type === 'chat.event' && event.sessionId === currentSessionId) {
-          setState((prev) => ({
-            ...prev,
-            historyStatus: 'ready',
-            composerError: event.state === 'error' ? event.errorMessage || 'chat_event_error' : prev.composerError,
-            sendStatus:
-              prev.sendStatus === 'queued' && event.state !== 'final' && event.state !== 'error'
-                ? 'waiting-response'
-                : prev.sendStatus,
-            runtimeNote:
-              prev.sendStatus === 'queued' && event.state !== 'final' && event.state !== 'error'
-                ? 'streaming'
-                : prev.runtimeNote,
-          }))
+          const st = classifyChatEventState(event.state)
+          setState((prev) => {
+            if (st === 'final') {
+              setSessions((current) => touchSessionState(current, currentSessionId, 'active'))
+              return {
+                ...prev,
+                historyStatus: 'ready',
+                sendStatus: 'completed',
+                toolActivityStatus: 'completed',
+                runtimeNote: 'completed',
+                currentRunStartedAt: undefined,
+                lastRunDurationMs: prev.currentRunStartedAt
+                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+                  : prev.lastRunDurationMs,
+              }
+            }
+            if (st === 'error') {
+              setSessions((current) => touchSessionState(current, currentSessionId, 'error'))
+              return {
+                ...prev,
+                historyStatus: 'ready',
+                composerError: event.errorMessage || 'chat_event_error',
+                sendStatus: 'error',
+                toolActivityStatus: 'failed',
+                runtimeNote: 'run failed',
+                currentRunStartedAt: undefined,
+                lastRunDurationMs: prev.currentRunStartedAt
+                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+                  : prev.lastRunDurationMs,
+              }
+            }
+            return {
+              ...prev,
+              historyStatus: 'ready',
+              composerError: prev.composerError,
+              sendStatus: prev.sendStatus === 'queued' && st === 'delta' ? 'waiting-response' : prev.sendStatus,
+              runtimeNote: prev.sendStatus === 'queued' && st === 'delta' ? 'streaming' : prev.runtimeNote,
+            }
+          })
 
-          if (event.state === 'final' || event.state === 'error') {
+          if (st === 'final' || st === 'error') {
             scheduleHistoryRefresh(currentSessionId, 120)
           }
         }
@@ -443,7 +548,10 @@ export function useAppState() {
                 runtimeNote: 'run failed',
               }
             }
-            if (event.event.type === 'run.completed') {
+            if (
+              event.event.type === 'run.completed' ||
+              event.event.type === 'message.assistant.completed'
+            ) {
               setSessions((current) => touchSessionState(current, currentSessionId, 'active'))
               return {
                 ...prev,
@@ -452,6 +560,9 @@ export function useAppState() {
                 toolActivityStatus: 'completed',
                 runtimeNote: 'completed',
                 currentRunStartedAt: undefined,
+                lastRunDurationMs: prev.currentRunStartedAt
+                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+                  : prev.lastRunDurationMs,
               }
             }
             if (event.event.type === 'run.stopped') {
@@ -475,10 +586,14 @@ export function useAppState() {
                 runtimeNote: 'running',
               }
             }
-            return {
-              ...prev,
-              historyStatus: 'ready',
+            const next = reconcileSendStatusFromAssistantRenderItem(
+              { ...prev, historyStatus: 'ready' },
+              event.renderItem,
+            )
+            if (next.sendStatus === 'completed' && prev.sendStatus !== 'completed') {
+              setSessions((current) => touchSessionState(current, currentSessionId, 'active'))
             }
+            return next
           })
         }
 
@@ -489,12 +604,38 @@ export function useAppState() {
             !isUserFacingRole(msg.role, msg.kind) &&
             msg.kind !== 'user' &&
             msg.role !== 'user'
-          setState((prev) => ({
-            ...prev,
-            historyStatus: 'ready',
-            sendStatus: prev.sendStatus === 'queued' && modelSide ? 'waiting-response' : prev.sendStatus,
-            runtimeNote: prev.sendStatus === 'queued' && modelSide ? 'streaming' : prev.runtimeNote,
-          }))
+          setState((prev) => {
+            const terminal =
+              msg &&
+              (msg.runStatus === 'completed' || msg.runStatus === 'failed' || msg.runStatus === 'stopped')
+            const isModel = msg && !isUserFacingRole(msg.role, msg.kind)
+            if (
+              terminal &&
+              isModel &&
+              (prev.sendStatus === 'waiting-response' || prev.sendStatus === 'queued' || prev.sendStatus === 'sending')
+            ) {
+              return {
+                ...prev,
+                historyStatus: 'ready',
+                sendStatus:
+                  msg.runStatus === 'failed' ? 'error' : msg.runStatus === 'stopped' ? 'stopped' : 'completed',
+                toolActivityStatus:
+                  msg.runStatus === 'failed' ? 'failed' : msg.runStatus === 'stopped' ? 'stopped' : 'completed',
+                runtimeNote:
+                  msg.runStatus === 'failed' ? 'run failed' : msg.runStatus === 'stopped' ? 'stopped' : 'completed',
+                currentRunStartedAt: undefined,
+                lastRunDurationMs: prev.currentRunStartedAt
+                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+                  : prev.lastRunDurationMs,
+              }
+            }
+            return {
+              ...prev,
+              historyStatus: 'ready',
+              sendStatus: prev.sendStatus === 'queued' && modelSide ? 'waiting-response' : prev.sendStatus,
+              runtimeNote: prev.sendStatus === 'queued' && modelSide ? 'streaming' : prev.runtimeNote,
+            }
+          })
         }
 
         if (event.type === 'message.batch' && event.sessionId === currentSessionId) {

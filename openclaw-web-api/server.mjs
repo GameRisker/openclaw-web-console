@@ -403,6 +403,16 @@ function normalizeHistoryContentForParts(content) {
   }
 }
 
+function pickHistoryRunStatus(message) {
+  const raw = message?.runStatus ?? message?.status ?? message?.state ?? message?.run_state
+  if (raw == null || raw === '') return 'completed'
+  const s = String(raw).toLowerCase()
+  if (s === 'running' || s === 'in_progress' || s === 'streaming' || s === 'pending' || s === 'active') return 'running'
+  if (s === 'failed' || s === 'error' || s === 'failure') return 'failed'
+  if (s === 'stopped' || s === 'aborted' || s === 'cancelled' || s === 'canceled') return 'stopped'
+  return 'completed'
+}
+
 function mapHistoryMessages(sessionId, history) {
   const rawMessages = Array.isArray(history?.messages)
     ? history.messages
@@ -416,6 +426,7 @@ function mapHistoryMessages(sessionId, history) {
     const rawContent = pickHistoryContent(message)
     const content = normalizeHistoryContentForParts(rawContent)
     const parts = contentParts(content, role, message)
+    const historyRunStatus = pickHistoryRunStatus(message)
     if (parts.length === 0) {
       let fallbackText = ''
       if (typeof rawContent === 'string') fallbackText = rawContent
@@ -436,6 +447,7 @@ function mapHistoryMessages(sessionId, history) {
           timestamp: message.timestamp ?? message.createdAt ?? message.ts ?? '',
           role,
           content: fallbackText,
+          runStatus: historyRunStatus,
         },
         { source: 'history', sessionId, message, index },
       )
@@ -453,6 +465,7 @@ function mapHistoryMessages(sessionId, history) {
             kind: part.kind,
             label: part.label,
             toolName: part.toolName,
+            runStatus: historyRunStatus,
           },
           { source: 'history', sessionId, message, index, part, partIndex },
         ),
@@ -465,12 +478,27 @@ function mapHistoryMessages(sessionId, history) {
  * Gateway → bridge `chat` 事件：建议 payload 含 sessionKey、state（delta|final|error）、runId、message；
  * 也接受 key / sessionId 别名，便于与 sessions.list、chat.send、chat.subscribe、chat.history 联调一致。
  */
+/** Map gateway variants to bridge semantics so flushChatEvent sets runStatus / run.* timeline correctly. */
+function canonicalizeGatewayChatState(state) {
+  if (state == null || state === '') return state
+  const s = String(state).toLowerCase().replace(/-/g, '_')
+  if (['final', 'complete', 'completed', 'done', 'success', 'finished', 'end', 'ok'].includes(s)) return 'final'
+  if (['error', 'failed', 'failure', 'cancelled', 'canceled'].includes(s)) return 'error'
+  if (
+    ['delta', 'streaming', 'stream', 'partial', 'in_progress', 'running', 'generating', 'active', 'pending'].includes(s)
+  ) {
+    return 'delta'
+  }
+  return state
+}
+
 function normalizeChatEventPayload(raw) {
   if (raw == null || typeof raw !== 'object') return null
   const sessionKey = raw.sessionKey ?? raw.key ?? raw.session_key
   const sessionId = raw.sessionId ?? raw.session_id
   const runId = raw.runId ?? raw.run_id
-  const state = raw.state ?? raw.phase ?? raw.status
+  const rawState = raw.state ?? raw.phase ?? raw.status
+  const state = rawState != null && rawState !== '' ? canonicalizeGatewayChatState(rawState) : rawState
   const errorMessage = raw.errorMessage ?? raw.error?.message ?? (typeof raw.error === 'string' ? raw.error : undefined)
   const stopReason = raw.stopReason ?? raw.stop_reason
   return {
