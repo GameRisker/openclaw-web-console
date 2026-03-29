@@ -11,15 +11,19 @@ import {
 } from './api'
 import { mockSideCards, mockSessions } from './mockData'
 import { connectRealtime } from './realtime'
+import { openclawWebLog } from './debugLog'
 import type { RealtimeEvent, ApiMessage, TimelineRenderItem, TimelineEventItem } from '../types/api'
 import type { AppState, SessionItem } from '../types/app'
 import { isUserFacingRole, timelineItemLooksLikeUserMessage } from '../utils/roles'
+import { HISTORY_FETCH_MAX, HISTORY_OLDER_STEP, HISTORY_PAGE_SIZE } from '../constants/history'
 
 const initialState: AppState = {
   authStatus: 'authenticated',
   connectionStatus: 'connecting',
   sessionListStatus: 'loading',
   activeSessionId: 'main',
+  historyHasMore: false,
+  historyLoadingOlder: false,
   historyStatus: 'loading-history',
   sendStatus: 'idle',
   toolActivityStatus: 'idle',
@@ -302,6 +306,99 @@ function normalizeMessages(messages: ApiMessage[]) {
   return merged
 }
 
+function sortMessagesChronological(messages: ApiMessage[]): ApiMessage[] {
+  return [...messages].sort(
+    (a, b) =>
+      toTimestampMs(a.timestamp) - toTimestampMs(b.timestamp) || String(a.id).localeCompare(String(b.id)),
+  )
+}
+
+/** 时间用毫秒；不含 runStatus，避免 API 与 WS 对同一条状态字段不一致导致无法合并 */
+function messageFingerprint(m: ApiMessage): string {
+  return `${m.role}|${toTimestampMs(m.timestamp)}|${m.content}`
+}
+
+function pickBetterHistoryDuplicate(
+  a: ApiMessage,
+  b: ApiMessage,
+  incomingIds: Set<string>,
+): ApiMessage {
+  const inA = incomingIds.has(a.id)
+  const inB = incomingIds.has(b.id)
+  if (inA && !inB) return a
+  if (inB && !inA) return b
+  const rank = (x: ApiMessage) => (String(x.id).startsWith('local-user-') ? 0 : 1)
+  if (rank(a) !== rank(b)) return rank(a) > rank(b) ? a : b
+  return String(a.id).localeCompare(String(b.id)) <= 0 ? a : b
+}
+
+function mergeMessagesUniqueChronological(existing: ApiMessage[], incoming: ApiMessage[]): ApiMessage[] {
+  const incomingIds = new Set(incoming.map((m) => m.id))
+  const byId = new Map<string, ApiMessage>()
+  for (const m of existing) byId.set(m.id, m)
+  for (const m of incoming) byId.set(m.id, m)
+  const combined = Array.from(byId.values())
+  const byFp = new Map<string, ApiMessage>()
+  for (const m of combined) {
+    const fp = messageFingerprint(m)
+    const prev = byFp.get(fp)
+    if (!prev) {
+      byFp.set(fp, m)
+      continue
+    }
+    byFp.set(fp, pickBetterHistoryDuplicate(prev, m, incomingIds))
+  }
+  return sortMessagesChronological(Array.from(byFp.values()))
+}
+
+/**
+ * 历史分页/合并用：与列表展示一致优先用 `messages`（AppShell 只渲染 messages），避免与 renderItems 里
+ * 另一条 id 体系拼在一起变双份；仅当尚未灌入 messages 时才用时间线快照。
+ */
+function getHistoryMergeBase(renderItems: TimelineRenderItem[], messages: ApiMessage[]): ApiMessage[] {
+  if (messages.length > 0) return messages
+  return renderItems.length > 0 ? timelineRenderItemsToApiMessages(renderItems) : []
+}
+
+/** 与页面 displayMessages 一致；WS timeline 只更新 renderItems 时 messages 可能空，分页/合并必须以本快照为基准 */
+function timelineRenderItemsToApiMessages(items: TimelineRenderItem[]): ApiMessage[] {
+  return [...items]
+    .sort(
+      (a, b) =>
+        toTimestampMs(a.timestamp) - toTimestampMs(b.timestamp) || String(a.id).localeCompare(String(b.id)),
+    )
+    .map((item) => ({
+      id: item.id,
+      timestamp: item.timestamp,
+      role:
+        item.kind === 'toolCall'
+          ? 'tool'
+          : item.kind === 'toolResult'
+            ? 'toolResult'
+            : item.kind === 'verbose'
+              ? 'verbose'
+              : timelineItemLooksLikeUserMessage(item)
+                ? 'user'
+                : (item.kind as string) === 'text'
+                  ? 'assistant'
+                  : item.kind,
+      content:
+        item.kind === 'toolCall'
+          ? item.content.replace(/^\[toolCall\]\s*/i, '')
+          : item.kind === 'toolResult'
+            ? item.content.replace(/^\[toolResult\]\s*/i, '')
+            : item.content,
+      kind: timelineItemLooksLikeUserMessage(item) ? 'user' : item.kind,
+      label: item.label,
+      toolName: item.toolName,
+      runStatus: item.status,
+    }))
+}
+
+function getDisplayMessagesSnapshot(renderItems: TimelineRenderItem[], messages: ApiMessage[]): ApiMessage[] {
+  return renderItems.length > 0 ? timelineRenderItemsToApiMessages(renderItems) : messages
+}
+
 export function useAppState() {
   const [state, setState] = useState<AppState>(initialState)
   const [sessions, setSessions] = useState<SessionItem[]>(mockSessions)
@@ -314,27 +411,25 @@ export function useAppState() {
   const messagesRef = useRef<ApiMessage[]>([])
   const renderItemsRef = useRef<TimelineRenderItem[]>([])
   const refreshHistoryTimerRef = useRef<number | null>(null)
+  /** 用于区分「换会话」与 effect 因 sessionList 等重复触发，避免误清空列表 */
+  const prevHistorySessionIdRef = useRef<string | null>(null)
+  const historyHasMoreRef = useRef(false)
+  const historyLoadingOlderRef = useRef(false)
   const queuedFallbackTimerRef = useRef<number | null>(null)
   const sendAbortControllerRef = useRef<AbortController | null>(null)
   const autoTitledSessionIdsRef = useRef<Set<string>>(new Set())
   const manuallyTitledSessionIdsRef = useRef<Set<string>>(new Set())
   const sessionsRef = useRef<SessionItem[]>(sessions)
 
-  useEffect(() => {
-    sessionsRef.current = sessions
-  }, [sessions])
-
-  useEffect(() => {
-    activeSessionIdRef.current = state.activeSessionId
-  }, [state.activeSessionId])
-
-  useEffect(() => {
-    messagesRef.current = messages
-  }, [messages])
-
-  useEffect(() => {
-    renderItemsRef.current = renderItems
-  }, [renderItems])
+  /**
+   * 与 state 同步 ref 必须在 render 内完成（勿仅靠 useEffect），否则 paint 后、effect 前用户点击
+   * 「加载更早」会读到空 ref → oldestId 为空 → 直接 return 并误关 hasMore。
+   */
+  sessionsRef.current = sessions
+  activeSessionIdRef.current = state.activeSessionId
+  messagesRef.current = messages
+  renderItemsRef.current = renderItems
+  historyHasMoreRef.current = state.historyHasMore
 
   useEffect(() => {
     if (state.sendStatus === 'queued') return
@@ -396,39 +491,201 @@ export function useAppState() {
     return normalizedSessions
   }
 
-  async function refreshHistory(sessionId: string) {
-    setState((prev) => ({ ...prev, historyStatus: 'loading-history' }))
+  async function refreshHistory(sessionId: string, mode: 'replace' | 'merge-tail' = 'replace') {
+    if (mode === 'replace') {
+      setState((prev) => ({
+        ...prev,
+        historyStatus: 'loading-history',
+        historyLoadingOlder: false,
+      }))
+    }
 
     try {
-      const history = await fetchSessionHistory(sessionId)
+      const history = await fetchSessionHistory(sessionId, { limit: HISTORY_PAGE_SIZE })
       if (activeSessionIdRef.current !== sessionId) return
 
       const normalized = normalizeMessages(history.messages)
+      const tailHasMore = history.hasMore ?? normalized.length >= HISTORY_PAGE_SIZE
+
+      const snapshot = getHistoryMergeBase(renderItemsRef.current, messagesRef.current)
+      if (mode === 'merge-tail' && snapshot.length > 0) {
+        const merged = mergeMessagesUniqueChronological(snapshot, normalized)
+        const renderMerged = toRenderItemsFromMessages(merged, sessionId)
+        setMessages(merged)
+        setRenderItems((prev) => mergeSnapshotRenderItems(renderMerged, prev, sessionId))
+        setState((prev) => {
+          const next = reconcileSendStatusAfterHistory({ ...prev, historyStatus: 'ready' }, merged)
+          return {
+            ...next,
+            composerError: undefined,
+            historyHasMore: prev.historyHasMore || tailHasMore,
+          }
+        })
+        return
+      }
+
       setMessages(normalized)
       setRenderItems((prev) =>
         mergeSnapshotRenderItems(toRenderItemsFromMessages(normalized, sessionId), prev, sessionId),
       )
       setState((prev) => {
         const next = reconcileSendStatusAfterHistory({ ...prev, historyStatus: 'ready' }, normalized)
-        // HTTP 历史已成功：清掉此前 WS session.error 等留下的 composerError，避免与正常 meta 叠显
-        return { ...next, composerError: undefined }
+        return {
+          ...next,
+          composerError: undefined,
+          historyHasMore: tailHasMore,
+        }
       })
     } catch {
       if (activeSessionIdRef.current !== sessionId) return
-      setMessages([])
-      setRenderItems([])
-      setState((prev) => ({ ...prev, historyStatus: 'error' }))
+      if (mode === 'replace') {
+        setMessages([])
+        setRenderItems([])
+        setState((prev) => ({
+          ...prev,
+          historyStatus: 'error',
+          historyHasMore: false,
+        }))
+      } else {
+        setState((prev) => ({ ...prev, historyStatus: 'ready' }))
+      }
     }
   }
 
-  function scheduleHistoryRefresh(sessionId: string, delay = 80) {
+  function scheduleHistoryRefresh(sessionId: string, delay = 80, mode: 'replace' | 'merge-tail' = 'replace') {
     if (refreshHistoryTimerRef.current) {
       window.clearTimeout(refreshHistoryTimerRef.current)
     }
     refreshHistoryTimerRef.current = window.setTimeout(() => {
       refreshHistoryTimerRef.current = null
-      void refreshHistory(sessionId)
+      void refreshHistory(sessionId, mode)
     }, delay)
+  }
+
+  function getOldestIdForHistoryPagination(): string | undefined {
+    const base = getHistoryMergeBase(renderItemsRef.current, messagesRef.current)
+    const sorted = sortMessagesChronological(base)
+    return sorted[0]?.id
+  }
+
+  async function loadOlderHistory() {
+    const sessionId = activeSessionIdRef.current
+    if (!sessionId) {
+      openclawWebLog('loadOlder skip', { reason: 'no activeSessionId' })
+      return
+    }
+    if (historyLoadingOlderRef.current) {
+      openclawWebLog('loadOlder skip', { reason: 'already loading older' })
+      return
+    }
+    if (!historyHasMoreRef.current) {
+      openclawWebLog('loadOlder skip', { reason: 'historyHasMoreRef false' })
+      return
+    }
+
+    const oldestId = getOldestIdForHistoryPagination()
+    if (!oldestId) {
+      openclawWebLog('loadOlder skip', {
+        reason: 'no oldestId',
+        renderItemsLen: renderItemsRef.current.length,
+        messagesLen: messagesRef.current.length,
+      })
+      historyHasMoreRef.current = false
+      setState((prev) => ({ ...prev, historyHasMore: false }))
+      return
+    }
+
+    historyLoadingOlderRef.current = true
+    setState((prev) => ({ ...prev, historyLoadingOlder: true }))
+
+    try {
+      const hadBase = getHistoryMergeBase(renderItemsRef.current, messagesRef.current)
+      const hadFp = new Set(hadBase.map(messageFingerprint))
+
+      openclawWebLog('loadOlder start', {
+        sessionId,
+        oldestId,
+        snapshotRows: hadBase.length,
+        hadFingerprints: hadFp.size,
+      })
+
+      let data = await fetchSessionHistory(sessionId, { limit: HISTORY_OLDER_STEP, before: oldestId })
+      if (activeSessionIdRef.current !== sessionId) {
+        openclawWebLog('loadOlder aborted', { reason: 'sessionId changed after fetch #1' })
+        return
+      }
+
+      let normalized = normalizeMessages(data.messages)
+      let newCount = normalized.filter((m) => !hadFp.has(messageFingerprint(m))).length
+      let reqLimit = HISTORY_OLDER_STEP
+      /** 上一次 expand 实际返回条数；limit 加大仍不增多说明已到网关/会话可返回上限 */
+      let lastExpandReturnedLen = normalized.length
+
+      openclawWebLog('loadOlder response #1', {
+        limit: HISTORY_OLDER_STEP,
+        before: oldestId,
+        returned: normalized.length,
+        newCount,
+        hasMoreFromApi: data.hasMore,
+        firstIds: normalized.slice(0, 5).map((m) => m.id),
+      })
+
+      // 网关常忽略 before，仍返回同一批「最近 N 条」→ 无新 id。按步长增大 limit 拉最近 N 条再合并（不依赖游标）。
+      while (newCount === 0 && reqLimit < HISTORY_FETCH_MAX) {
+        const prevLimit = reqLimit
+        reqLimit = Math.min(HISTORY_FETCH_MAX, reqLimit + HISTORY_OLDER_STEP)
+        if (reqLimit <= prevLimit) break
+        openclawWebLog('loadOlder expand retry', { reqLimit })
+        data = await fetchSessionHistory(sessionId, { limit: reqLimit })
+        if (activeSessionIdRef.current !== sessionId) {
+          openclawWebLog('loadOlder aborted', { reason: 'sessionId changed during expand', reqLimit })
+          return
+        }
+        normalized = normalizeMessages(data.messages)
+        if (lastExpandReturnedLen > 0 && normalized.length === lastExpandReturnedLen) {
+          openclawWebLog('loadOlder expand plateau', {
+            reqLimit,
+            returned: normalized.length,
+            note: 'limit↑但条数不变，已到服务端可返回上限或会话仅这么多条',
+          })
+          break
+        }
+        lastExpandReturnedLen = normalized.length
+        newCount = normalized.filter((m) => !hadFp.has(messageFingerprint(m))).length
+        openclawWebLog('loadOlder expand result', { reqLimit, returned: normalized.length, newCount })
+      }
+
+      const merged = mergeMessagesUniqueChronological(
+        getHistoryMergeBase(renderItemsRef.current, messagesRef.current),
+        normalized,
+      )
+      const serverHasMore = data.hasMore ?? normalized.length >= reqLimit
+      const nextHasMore = newCount === 0 ? false : serverHasMore
+
+      openclawWebLog('loadOlder done', {
+        mergedLen: merged.length,
+        newCount,
+        reqLimit,
+        nextHasMore,
+        serverHasMore,
+      })
+
+      setMessages(merged)
+      setRenderItems((prev) =>
+        mergeSnapshotRenderItems(toRenderItemsFromMessages(merged, sessionId), prev, sessionId),
+      )
+      setState((prev) => ({
+        ...prev,
+        historyHasMore: nextHasMore,
+      }))
+    } catch (err) {
+      openclawWebLog('loadOlderHistory failed', err instanceof Error ? err.message : String(err))
+    } finally {
+      historyLoadingOlderRef.current = false
+      if (activeSessionIdRef.current === sessionId) {
+        setState((prev) => ({ ...prev, historyLoadingOlder: false }))
+      }
+    }
   }
 
   useEffect(() => {
@@ -470,7 +727,7 @@ export function useAppState() {
           }))
 
           if (!event.messages?.length && renderItemsRef.current.length === 0) {
-            scheduleHistoryRefresh(currentSessionId, 40)
+            scheduleHistoryRefresh(currentSessionId, 40, 'merge-tail')
           }
         }
 
@@ -512,7 +769,7 @@ export function useAppState() {
           })
 
           if (st === 'final' || st === 'error') {
-            scheduleHistoryRefresh(currentSessionId, 120)
+            scheduleHistoryRefresh(currentSessionId, 120, 'merge-tail')
           }
         }
 
@@ -653,12 +910,12 @@ export function useAppState() {
         }
 
         if (event.type === 'message.batch' && event.sessionId === currentSessionId) {
+          const normalizedReplace = event.replace ? normalizeMessages(event.messages) : []
           if (event.replace) {
-            const normalized = normalizeMessages(event.messages)
-            setMessages(normalized)
+            setMessages(normalizedReplace)
             setRenderItems((prev) =>
               mergeSnapshotRenderItems(
-                toRenderItemsFromMessages(normalized, event.sessionId),
+                toRenderItemsFromMessages(normalizedReplace, event.sessionId),
                 prev,
                 event.sessionId,
               ),
@@ -667,7 +924,13 @@ export function useAppState() {
           setState((prev) => ({
             ...prev,
             historyStatus: 'ready',
-            ...(event.replace ? { composerError: undefined } : {}),
+            ...(event.replace
+              ? {
+                  composerError: undefined,
+                  historyHasMore:
+                    event.hasMore ?? normalizedReplace.length >= HISTORY_PAGE_SIZE,
+                }
+              : {}),
           }))
         }
 
@@ -719,12 +982,30 @@ export function useAppState() {
     const hasActiveSession = sessionsRef.current.some((session) => session.id === state.activeSessionId)
     if (!hasActiveSession) return
 
-    setState((prev) => ({
-      ...prev,
-      historyStatus: prev.historyStatus === 'ready' ? prev.historyStatus : 'loading-history',
-    }))
     realtimeRef.current?.subscribe(state.activeSessionId)
-    scheduleHistoryRefresh(state.activeSessionId, 250)
+
+    const idChanged = prevHistorySessionIdRef.current !== state.activeSessionId
+    prevHistorySessionIdRef.current = state.activeSessionId
+
+    if (idChanged) {
+      setMessages([])
+      setRenderItems([])
+      setState((prev) => ({
+        ...prev,
+        historyStatus: 'loading-history',
+        historyHasMore: false,
+        historyLoadingOlder: false,
+      }))
+    }
+
+    scheduleHistoryRefresh(state.activeSessionId, 250, idChanged ? 'replace' : 'merge-tail')
+
+    return () => {
+      if (refreshHistoryTimerRef.current != null) {
+        window.clearTimeout(refreshHistoryTimerRef.current)
+        refreshHistoryTimerRef.current = null
+      }
+    }
   }, [state.activeSessionId, state.sessionListStatus])
 
   const filteredSessions = useMemo(() => {
@@ -749,40 +1030,7 @@ export function useAppState() {
   const currentDraft = state.draftBySession[state.activeSessionId] ?? ''
 
   const displayMessages = useMemo(
-    () =>
-      renderItems.length
-        ? [...renderItems]
-            .sort((a, b) => {
-              const diff = toTimestampMs(a.timestamp) - toTimestampMs(b.timestamp)
-              return diff !== 0 ? diff : String(a.id).localeCompare(String(b.id))
-            })
-            .map((item) => ({
-              id: item.id,
-              timestamp: item.timestamp,
-              role:
-                item.kind === 'toolCall'
-                  ? 'tool'
-                  : item.kind === 'toolResult'
-                    ? 'toolResult'
-                    : item.kind === 'verbose'
-                      ? 'verbose'
-                      : timelineItemLooksLikeUserMessage(item)
-                        ? 'user'
-                        : (item.kind as string) === 'text'
-                          ? 'assistant'
-                          : item.kind,
-              content:
-                item.kind === 'toolCall'
-                  ? item.content.replace(/^\[toolCall\]\s*/i, '')
-                  : item.kind === 'toolResult'
-                    ? item.content.replace(/^\[toolResult\]\s*/i, '')
-                    : item.content,
-              kind: timelineItemLooksLikeUserMessage(item) ? 'user' : item.kind,
-              label: item.label,
-              toolName: item.toolName,
-              runStatus: item.status,
-            }))
-        : messages,
+    () => getDisplayMessagesSnapshot(renderItems, messages),
     [renderItems, messages],
   )
 
@@ -902,10 +1150,10 @@ export function useAppState() {
           }
         })
       }, 2500)
-      scheduleHistoryRefresh(sessionId, 600)
+      scheduleHistoryRefresh(sessionId, 600, 'merge-tail')
       window.setTimeout(() => {
         if (activeSessionIdRef.current !== sessionId) return
-        void refreshHistory(sessionId)
+        void refreshHistory(sessionId, 'merge-tail')
       }, 3500)
     } catch (error) {
       const aborted =
@@ -1129,7 +1377,8 @@ export function useAppState() {
       })),
     sendCurrentMessage,
     stopCurrentRun,
-    refreshHistory: () => refreshHistory(state.activeSessionId),
+    refreshHistory: () => void refreshHistory(state.activeSessionId, 'replace'),
+    loadOlderHistory,
     createNewSession,
     renameSessionTitle,
     removeSession,

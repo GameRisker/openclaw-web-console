@@ -1,4 +1,5 @@
 import type { SessionHistoryResponse, SessionsResponse } from '../types/api'
+import { HISTORY_PAGE_SIZE } from '../constants/history'
 import { openclawWebLog } from './debugLog'
 
 export async function fetchSessions() {
@@ -7,9 +8,16 @@ export async function fetchSessions() {
   return (await response.json()) as SessionsResponse
 }
 
-export async function fetchSessionHistory(sessionId: string) {
-  openclawWebLog('http history request', { sessionId })
-  const response = await fetch(`/api/sessions/${sessionId}/history`)
+export async function fetchSessionHistory(
+  sessionId: string,
+  options?: { limit?: number; before?: string },
+) {
+  const params = new URLSearchParams()
+  params.set('limit', String(options?.limit ?? HISTORY_PAGE_SIZE))
+  if (options?.before) params.set('before', options.before)
+  const qs = params.toString()
+  openclawWebLog('http history request', { sessionId, limit: options?.limit ?? HISTORY_PAGE_SIZE, before: options?.before })
+  const response = await fetch(`/api/sessions/${sessionId}/history?${qs}`)
   let data: SessionHistoryResponse
   try {
     data = (await response.json()) as SessionHistoryResponse
@@ -22,6 +30,7 @@ export async function fetchSessionHistory(sessionId: string) {
     status: response.status,
     messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
     sessionId: data.sessionId,
+    hasMore: data.hasMore,
   })
   if (!response.ok) throw new Error('failed_to_fetch_history')
   return data

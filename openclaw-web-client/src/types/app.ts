@@ -55,6 +55,10 @@ export interface AppState {
   connectionStatus: ConnectionStatus
   sessionListStatus: SessionListStatus
   activeSessionId: string
+  /** 是否还可能存在更早历史（用于向上滚动分页） */
+  historyHasMore: boolean
+  /** 正在请求更早一页 */
+  historyLoadingOlder: boolean
   historyStatus: HistoryStatus
   sendStatus: SendStatus
   toolActivityStatus: ToolActivityStatus

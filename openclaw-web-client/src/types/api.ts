@@ -32,6 +32,8 @@ export interface SessionHistoryResponse {
   sessionId: string
   sessionKey?: string
   messages: ApiMessage[]
+  /** 是否可能还有更早消息（桥接启发式：条数 >= limit；网关若返回精确值可后续透传） */
+  hasMore?: boolean
 }
 
 export interface RealtimeSessionUpdate {
@@ -77,6 +79,7 @@ export interface RealtimeMessageBatch {
   sessionKey?: string
   replace?: boolean
   messages: ApiMessage[]
+  hasMore?: boolean
 }
 
 export interface RealtimeMessageUpsert {

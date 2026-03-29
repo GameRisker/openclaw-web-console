@@ -491,7 +491,7 @@ textarea {
 .chat-panel {
   position: relative;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 0;
   overflow: hidden;
   overflow-x: hidden;
@@ -509,13 +509,65 @@ textarea {
 /* 左缘箭头不占文档流，给主内容略加左内边距避免与窄条叠字 */
 .chat-panel.chat-panel--sessions-collapsed .chat-header,
 .chat-panel.chat-panel--sessions-collapsed .message-list,
-.chat-panel.chat-panel--sessions-collapsed .jump-to-bottom-wrap,
 .chat-panel.chat-panel--sessions-collapsed .composer {
   padding-left: calc(14px + 12px);
 }
 
 .chat-header {
   padding-bottom: 2px;
+}
+
+/* 消息区 + 悬浮「回到底部」：不占文档流，不缩短滚动条可视高度 */
+.chat-messages-stack {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chat-messages-stack .message-list {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.jump-to-bottom-fab {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  z-index: 4;
+  transform: translateX(-50%);
+  width: 30px;
+  height: 30px;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 50%;
+  background: rgba(30, 41, 59, 0.88);
+  color: #94a3b8;
+  box-shadow: 0 2px 12px rgba(15, 23, 42, 0.35);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.jump-to-bottom-fab:hover {
+  color: #cbd5e1;
+  border-color: rgba(148, 163, 184, 0.35);
+  background: rgba(51, 65, 85, 0.92);
+}
+
+.jump-to-bottom-fab:active {
+  transform: translateX(-50%) scale(0.96);
+}
+
+.jump-to-bottom-fab-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
 }
 
 .chat-title-wrap {
@@ -543,6 +595,85 @@ textarea {
   align-items: start;
   overscroll-behavior: contain;
   scroll-behavior: smooth;
+}
+
+/* prepend 历史后程序设置 scrollTop 时临时关闭 smooth，避免列表上下抖 */
+.message-list.message-list--instant-scroll {
+  scroll-behavior: auto;
+}
+
+.message-list-history-hint {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  text-align: center;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: 0.02em;
+  color: #6d7d92;
+  padding: 5px 8px 7px;
+  flex-shrink: 0;
+  margin: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  border-radius: 8px;
+}
+
+.message-list-history-hint:hover:not(:disabled) {
+  color: #94a3b8;
+  background: rgba(100, 116, 139, 0.1);
+}
+
+.message-list-history-hint:disabled {
+  cursor: default;
+  color: #5c6a7d;
+  opacity: 0.85;
+}
+
+.message-list-history-hint-dots {
+  display: inline-block;
+  margin-left: 0.06em;
+  white-space: nowrap;
+}
+
+.message-list-history-hint-dot {
+  display: inline-block;
+  animation: message-list-history-hint-dot-wave 1.05s ease-in-out infinite;
+  will-change: opacity, transform;
+}
+
+.message-list-history-hint-dot:nth-child(1) {
+  animation-delay: 0ms;
+}
+
+.message-list-history-hint-dot:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.message-list-history-hint-dot:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@keyframes message-list-history-hint-dot-wave {
+  0%,
+  100% {
+    opacity: 0.2;
+    transform: translateY(0);
+  }
+
+  35% {
+    opacity: 1;
+    transform: translateY(-1.5px);
+  }
+
+  70% {
+    opacity: 0.45;
+    transform: translateY(0);
+  }
 }
 
 /* Grid 子项默认 min-width:auto，宽屏 + 右对齐气泡会被 overflow 裁切；允许在列宽内收缩 */
@@ -610,6 +741,19 @@ textarea {
   text-overflow: ellipsis;
 }
 
+.message-card-time {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 1px;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.2;
+  color: rgba(148, 163, 184, 0.48);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
 .message-card.user {
   background: rgba(37, 99, 235, 0.18);
   border-color: rgba(96, 165, 250, 0.35);
@@ -661,6 +805,30 @@ textarea {
 
 .message-card.muted {
   background: rgba(148, 163, 184, 0.08);
+}
+
+/* 列表内状态条：首屏「Loading」、同步中、错误 — 小号弱对比 */
+.message-list > .message-card.muted {
+  padding: 9px 11px;
+  font-size: 10px;
+  line-height: 1.35;
+  color: rgba(203, 213, 225, 0.72);
+}
+
+.message-list > .message-card.muted strong {
+  display: block;
+  margin: 0 0 3px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.78);
+}
+
+.message-list > .message-card.muted p {
+  margin: 0;
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.88);
 }
 
 .message-content {
@@ -789,20 +957,6 @@ textarea {
   min-width: 0;
   max-width: 100%;
   overflow-x: hidden;
-}
-
-.jump-to-bottom-wrap {
-  display: flex;
-  justify-content: center;
-  padding: 0 16px 10px;
-  flex: 0 0 auto;
-  margin-top: auto;
-}
-
-.jump-to-bottom-button {
-  padding: 8px 14px;
-  border-radius: 999px;
-  font-size: 12px;
 }
 
 .composer-header {
@@ -997,7 +1151,7 @@ textarea {
   }
 
   .chat-panel {
-    grid-template-rows: auto minmax(0, 1fr) auto auto;
+    grid-template-rows: auto minmax(0, 1fr) auto;
     min-height: 0;
   }
 

@@ -3,6 +3,7 @@ import type { KeyboardEvent } from 'react'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { useAppState } from '../state/useAppState'
+import { openclawWebLog } from '../state/debugLog'
 import { isUserFacingRole } from '../utils/roles'
 
 function getConnectionPillClass(status: string) {
@@ -80,6 +81,52 @@ function formatRelativeTime(timestamp?: number) {
   return `${days}d ago`
 }
 
+function toMessageTimeMs(ts?: string): number {
+  if (!ts) return 0
+  const numeric = Number(ts)
+  if (Number.isFinite(numeric) && numeric > 0) {
+    if (numeric < 1e12) return Math.round(numeric * 1000)
+    return Math.round(numeric)
+  }
+  const parsed = Date.parse(String(ts))
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+/** 气泡内轻量时间：今天仅 HH:mm；非今天带月日 + 时间，跨年再加年份 */
+function formatMessageTimeMeta(timestamp?: string): { label: string; iso: string; title: string } | null {
+  const ms = toMessageTimeMs(timestamp)
+  if (ms <= 0) return null
+  const d = new Date(ms)
+  const now = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  const mon = d.getMonth() + 1
+  const day = d.getDate()
+  const y = d.getFullYear()
+  let label: string
+  if (sameDay) {
+    label = hm
+  } else if (y === now.getFullYear()) {
+    label = `${mon}月${day}日 ${hm}`
+  } else {
+    label = `${y}年${mon}月${day}日 ${hm}`
+  }
+  const title = d.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+  return { label, iso: d.toISOString(), title }
+}
+
 export function AppShellPage() {
   const {
     state,
@@ -95,6 +142,7 @@ export function AppShellPage() {
     setDraft,
     sendCurrentMessage,
     refreshHistory,
+    loadOlderHistory,
     createNewSession,
     renameSessionTitle,
     modelSideStreaming,
@@ -256,6 +304,34 @@ export function AppShellPage() {
     }
   }, [activeSession.id])
 
+  /** 仅点击加载更早；prepend 后一次性修正 scrollTop，避免 smooth 导致滚动条晃动 */
+  function handleLoadOlderClick() {
+    if (!state.historyHasMore || state.historyStatus !== 'ready') {
+      openclawWebLog('loadOlder click blocked', {
+        historyHasMore: state.historyHasMore,
+        historyStatus: state.historyStatus,
+      })
+      return
+    }
+    openclawWebLog('loadOlder click → fetch')
+    const list = messageListRef.current
+    const prevScrollHeight = list?.scrollHeight ?? 0
+    const prevScrollTop = list?.scrollTop ?? 0
+    void loadOlderHistory().then(() => {
+      requestAnimationFrame(() => {
+        const n = messageListRef.current
+        if (!n) return
+        const delta = n.scrollHeight - prevScrollHeight
+        if (delta <= 0) return
+        n.classList.add('message-list--instant-scroll')
+        n.scrollTop = prevScrollTop + delta
+        requestAnimationFrame(() => {
+          n.classList.remove('message-list--instant-scroll')
+        })
+      })
+    })
+  }
+
   function handleMessageListScroll() {
     const node = messageListRef.current
     if (!node) return
@@ -408,7 +484,32 @@ export function AppShellPage() {
             </div>
           </div>
 
-          <div ref={messageListRef} className="message-list" onScroll={handleMessageListScroll}>
+          <div className="chat-messages-stack">
+            <div ref={messageListRef} className="message-list" onScroll={handleMessageListScroll}>
+            {(state.historyHasMore || state.historyLoadingOlder) && (
+              <button
+                type="button"
+                className="message-list-history-hint"
+                aria-live="polite"
+                aria-busy={state.historyLoadingOlder}
+                disabled={state.historyLoadingOlder || !state.historyHasMore}
+                onClick={() => handleLoadOlderClick()}
+              >
+                {state.historyLoadingOlder ? (
+                  <>
+                    加载更早消息
+                    <span className="message-list-history-hint-dots" aria-hidden="true">
+                      <span className="message-list-history-hint-dot">.</span>
+                      <span className="message-list-history-hint-dot">.</span>
+                      <span className="message-list-history-hint-dot">.</span>
+                    </span>
+                  </>
+                ) : (
+                  '点击加载更早记录'
+                )}
+              </button>
+            )}
+
             {state.historyStatus === 'loading-history' && visibleMessages.length === 0 && (
               <article className="message-card muted">
                 <strong>Loading</strong>
@@ -460,6 +561,7 @@ export function AppShellPage() {
                   index === lastUserMessageIndex &&
                   Boolean(state.currentRunStartedAt)
                 const showStreamingTimer = isLatestRunningMessage || showWaitTimerOnUserTail
+                const messageTimeMeta = formatMessageTimeMeta(message.timestamp)
 
                 return (
                   <article key={message.id} className={`message-row ${messageClass}`}>
@@ -483,6 +585,15 @@ export function AppShellPage() {
                           </strong>
                           {headerLabel && <span className="message-header-label">{headerLabel}</span>}
                         </div>
+                        {messageTimeMeta && (
+                          <time
+                            className="message-card-time"
+                            dateTime={messageTimeMeta.iso}
+                            title={messageTimeMeta.title}
+                          >
+                            {messageTimeMeta.label}
+                          </time>
+                        )}
                       </div>
                       <div
                         className="message-content markdown-content"
@@ -494,15 +605,25 @@ export function AppShellPage() {
                   </article>
                 )
               })}
-          </div>
-
-          {showJumpToBottom && (
-            <div className="jump-to-bottom-wrap">
-              <button className="secondary-button jump-to-bottom-button" onClick={jumpToBottom}>
-                回到底部
-              </button>
             </div>
-          )}
+
+            {showJumpToBottom && (
+              <button
+                type="button"
+                className="jump-to-bottom-fab"
+                onClick={jumpToBottom}
+                aria-label="回到底部"
+                title="回到底部"
+              >
+                <svg className="jump-to-bottom-fab-icon" viewBox="0 0 24 24" aria-hidden>
+                  <path
+                    fill="currentColor"
+                    d="M12 15.5c-.2 0-.4-.1-.5-.2l-4.5-4.5c-.3-.3-.3-.8 0-1.1s.8-.3 1.1 0l3.9 3.9 3.9-3.9c.3-.3.8-.3 1.1 0s.3.8 0 1.1l-4.5 4.5c-.2.1-.4.2-.5.2z"
+                  />
+                </svg>
+              </button>
+            )}
+          </div>
 
           <div className="composer">
             <div className="composer-header">

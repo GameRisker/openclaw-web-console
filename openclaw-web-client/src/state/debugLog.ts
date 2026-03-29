@@ -4,6 +4,8 @@
  * - 开发模式 (vite dev)：默认开启
  * - 生产构建：执行 `localStorage.setItem('openclawWebDebug','1')` 后刷新
  * - 开发模式临时关闭：`localStorage.setItem('openclawWebDebug','0')` 后刷新
+ *
+ * 排查「加载更早」：看 `loadOlder click` / `loadOlder` 前缀；若出现 `blocked` 或 `skip` 即未发请求。
  */
 export function isOpenclawWebDebug(): boolean {
   if (typeof window === 'undefined') return false

@@ -19,6 +19,71 @@ const PORT = Number(process.env.PORT || 3001)
 const HOST = process.env.HOST || '0.0.0.0'
 const CONFIG_PATH = path.join(os.homedir(), '.openclaw', 'openclaw.json')
 
+/**
+ * WS 订阅首包 / 未传 limit 时的默认条数。
+ * 须与 openclaw-web-client/src/constants/history.ts 的 HISTORY_PAGE_SIZE 一致。
+ */
+const HISTORY_PAGE_DEFAULT = 20
+const HISTORY_PAGE_MAX = 200
+
+/** 网关 connect 请求的 scopes；部分网关要求 operator.admin，可通过 OPENCLAW_WEB_GATEWAY_SCOPES 覆盖（逗号分隔）。 */
+function gatewayConnectScopes() {
+  const raw = process.env.OPENCLAW_WEB_GATEWAY_SCOPES?.trim()
+  if (raw) return raw.split(/[,\s]+/).filter(Boolean)
+  return ['operator.read', 'operator.write', 'operator.admin']
+}
+
+function parseHistoryLimit(raw) {
+  const n = Number.parseInt(String(raw ?? ''), 10)
+  if (!Number.isFinite(n) || n < 1) return HISTORY_PAGE_DEFAULT
+  return Math.min(HISTORY_PAGE_MAX, Math.floor(n))
+}
+
+function buildChatHistoryParams(sessionKey, limit, before) {
+  const params = { sessionKey, limit }
+  if (before) params.before = before
+  return params
+}
+
+function sortMappedHistoryMessages(mapped) {
+  return [...mapped].sort(
+    (a, b) => toTimestampMs(a.timestamp) - toTimestampMs(b.timestamp) || String(a.id).localeCompare(String(b.id)),
+  )
+}
+
+/** 网关若返回精确 hasMore，优先采用；否则用「本页条数 >= limit」启发式 */
+function pickGatewayHasMoreFlag(raw) {
+  if (raw == null || typeof raw !== 'object') return undefined
+  if (typeof raw.hasMore === 'boolean') return raw.hasMore
+  if (typeof raw.has_more === 'boolean') return raw.has_more
+  if (typeof raw.more === 'boolean') return raw.more
+  if (raw.nextCursor != null && String(raw.nextCursor).trim() !== '') return true
+  if (raw.next_cursor != null && String(raw.next_cursor).trim() !== '') return true
+  return undefined
+}
+
+function computeHistoryHasMore(gatewayPayload, mappedLength, limit) {
+  const explicit = pickGatewayHasMoreFlag(gatewayPayload)
+  if (explicit === false) return false
+  if (explicit === true) return true
+  return mappedLength >= limit
+}
+
+/** 去掉与游标同 id；若网关误把 before 行放进本页则裁到该 id 之前（严格更早） */
+function applyBeforeCursorSanitize(mappedSortedAsc, beforeId) {
+  if (!beforeId || mappedSortedAsc.length === 0) return mappedSortedAsc
+  const idx = mappedSortedAsc.findIndex((m) => m.id === beforeId)
+  if (idx >= 0) return mappedSortedAsc.slice(0, idx)
+  return mappedSortedAsc.filter((m) => m.id !== beforeId)
+}
+
+function parseHistoryBeforeFromQuery(query) {
+  const raw = query.before ?? query.beforeMessageId ?? query.cursor ?? query.before_id
+  if (raw == null) return undefined
+  const s = String(raw).trim()
+  return s === '' ? undefined : s
+}
+
 app.use(express.json())
 
 function normalizeSession(item) {
@@ -85,12 +150,30 @@ async function runGatewayCall(method, params = {}, timeout = 10000) {
   return runOpenClawJson(args)
 }
 
+/** 避免短时间内多次 history / send 各打一次 sessions.list（每次都是独立 openclaw 子进程，很慢） */
+let sessionsListCache = null
+const SESSIONS_LIST_CACHE_TTL_MS = 4000
+
 async function listSessions() {
-  return runGatewayCall('sessions.list', {})
+  const result = await runGatewayCall('sessions.list', {})
+  sessionsListCache = { at: Date.now(), data: result }
+  return result
+}
+
+function invalidateSessionsListCache() {
+  sessionsListCache = null
+}
+
+async function listSessionsCached() {
+  const now = Date.now()
+  if (sessionsListCache && now - sessionsListCache.at < SESSIONS_LIST_CACHE_TTL_MS) {
+    return sessionsListCache.data
+  }
+  return listSessions()
 }
 
 async function resolveSession(sessionId) {
-  const result = await listSessions()
+  const result = await listSessionsCached()
   const id = String(sessionId)
   const match = result.sessions.find(
     (session) => String(session.sessionId ?? '') === id || String(session.key ?? '') === id,
@@ -482,6 +565,114 @@ function mapHistoryMessages(sessionId, history) {
 }
 
 /**
+ * `chat.history` 二级缓存（进程内 LRU）。见 docs/backend-history-cache-proposal.md §4。
+ * 多实例部署无共享缓存时各进程独立；可设 HISTORY_CACHE_ENABLED=0 关闭。
+ */
+const HISTORY_CACHE_ENABLED = !/^0|false|no$/i.test(String(process.env.HISTORY_CACHE_ENABLED ?? '1').trim())
+const HISTORY_CACHE_MAX_ENTRIES = Math.min(
+  2000,
+  Math.max(16, Number.parseInt(process.env.HISTORY_CACHE_MAX_ENTRIES ?? '256', 10) || 256),
+)
+const HISTORY_CACHE_TTL_MS = Math.max(0, Number.parseInt(process.env.HISTORY_CACHE_TTL_MS ?? '0', 10) || 0)
+
+const historyResponseCache = new Map()
+
+function historyCacheStorageKey(sessionKey, limit, before) {
+  return `${sessionKey}\x1e${limit}\x1e${before ?? ''}`
+}
+
+function historyCacheTouch(storageKey, entry) {
+  if (historyResponseCache.has(storageKey)) historyResponseCache.delete(storageKey)
+  historyResponseCache.set(storageKey, entry)
+  while (historyResponseCache.size > HISTORY_CACHE_MAX_ENTRIES) {
+    const oldest = historyResponseCache.keys().next().value
+    historyResponseCache.delete(oldest)
+  }
+}
+
+function historyCacheGet(storageKey) {
+  const entry = historyResponseCache.get(storageKey)
+  if (!entry) return null
+  if (HISTORY_CACHE_TTL_MS > 0 && Date.now() - entry.at > HISTORY_CACHE_TTL_MS) {
+    historyResponseCache.delete(storageKey)
+    return null
+  }
+  historyResponseCache.delete(storageKey)
+  historyResponseCache.set(storageKey, entry)
+  return entry
+}
+
+function invalidateHistoryCacheForSessionKey(sessionKey) {
+  if (!sessionKey) return
+  const prefix = `${sessionKey}\x1e`
+  for (const k of [...historyResponseCache.keys()]) {
+    if (k.startsWith(prefix)) historyResponseCache.delete(k)
+  }
+}
+
+/**
+ * 网关若不支持 `before`（或传了即报错），`chat.history` 会整段失败 → Web 收到 500。
+ * 降级：不带 before 拉一段窗口，在内存里按 beforeId 取「严格更早」且取靠近游标的最多 limit 条。
+ */
+function sliceOlderPageBeforeId(wideMappedAsc, beforeId, limit) {
+  const idx = wideMappedAsc.findIndex((m) => m.id === beforeId)
+  if (idx < 0) {
+    return { page: [], hasMore: false, foundCursor: false }
+  }
+  const older = wideMappedAsc.slice(0, idx)
+  const page = older.length <= limit ? older : older.slice(older.length - limit)
+  const hasMore = older.length > limit
+  return { page, hasMore, foundCursor: true }
+}
+
+async function loadHistoryMappedForSession(sessionId, sessionKey, limit, before) {
+  const storageKey = historyCacheStorageKey(sessionKey, limit, before ?? '')
+  if (HISTORY_CACHE_ENABLED) {
+    const hit = historyCacheGet(storageKey)
+    if (hit) {
+      return { messages: structuredClone(hit.messages), hasMore: hit.hasMore }
+    }
+  }
+
+  let history
+  let mapped
+  let hasMore
+
+  try {
+    history = await runGatewayCall('chat.history', buildChatHistoryParams(sessionKey, limit, before))
+    mapped = sortMappedHistoryMessages(mapHistoryMessages(sessionId, history))
+    if (before) mapped = applyBeforeCursorSanitize(mapped, before)
+    hasMore = computeHistoryHasMore(history, mapped.length, limit)
+  } catch (err) {
+    if (!before) throw err
+    bridgeLog('chat.history+before failed; wide fetch without before', {
+      sessionKey,
+      limit,
+      before,
+      err: err instanceof Error ? err.message : String(err),
+    })
+    const wideLimit = Math.min(HISTORY_PAGE_MAX, Math.max(limit * 20, 80))
+    history = await runGatewayCall('chat.history', buildChatHistoryParams(sessionKey, wideLimit, undefined))
+    const wideMapped = sortMappedHistoryMessages(mapHistoryMessages(sessionId, history))
+    const { page, hasMore: hm, foundCursor } = sliceOlderPageBeforeId(wideMapped, before, limit)
+    mapped = page
+    if (!foundCursor) {
+      bridgeLog('history before id missing in wide window', {
+        before,
+        wideLimit,
+        wideLen: wideMapped.length,
+      })
+    }
+    hasMore = foundCursor ? hm : false
+  }
+
+  if (HISTORY_CACHE_ENABLED) {
+    historyCacheTouch(storageKey, { at: Date.now(), messages: structuredClone(mapped), hasMore })
+  }
+  return { messages: mapped, hasMore }
+}
+
+/**
  * Gateway → bridge `chat` 事件：建议 payload 含 sessionKey、state（delta|final|error）、runId、message；
  * 也接受 key / sessionId 别名，便于与 sessions.list、chat.send、chat.subscribe、chat.history 联调一致。
  */
@@ -609,7 +800,7 @@ class NativeGatewayBridge {
                 ...(this.gatewayConfig.password ? { password: this.gatewayConfig.password } : {}),
               },
               role: 'operator',
-              scopes: ['operator.read', 'operator.write'],
+              scopes: gatewayConnectScopes(),
               caps: [],
             },
           })
@@ -969,6 +1160,7 @@ class NativeGatewayBridge {
       })
       return
     }
+    invalidateHistoryCacheForSessionKey(sessionKey)
     const sessionId = this.sessionKeyToId.get(sessionKey)
     const clients = this.sessionToClients.get(sessionKey)
     if (!sessionId || !clients || clients.size === 0) {
@@ -1035,6 +1227,7 @@ app.post('/api/sessions', async (req, res) => {
       label: initialLabel,
     })
 
+    invalidateSessionsListCache()
     res.json({ ok: true, sessionKey, label: initialLabel, result })
   } catch (error) {
     res.status(500).json({
@@ -1047,8 +1240,20 @@ app.post('/api/sessions', async (req, res) => {
 app.get('/api/sessions/:sessionId/history', async (req, res) => {
   try {
     const session = await resolveSession(req.params.sessionId)
-    const history = await runGatewayCall('chat.history', { sessionKey: session.key, limit: 200 })
-    res.json({ sessionId: req.params.sessionId, sessionKey: session.key, messages: mapHistoryMessages(req.params.sessionId, history) })
+    const limit = parseHistoryLimit(req.query.limit)
+    const before = parseHistoryBeforeFromQuery(req.query)
+    const { messages: mapped, hasMore } = await loadHistoryMappedForSession(
+      req.params.sessionId,
+      session.key,
+      limit,
+      before,
+    )
+    res.json({
+      sessionId: req.params.sessionId,
+      sessionKey: session.key,
+      messages: mapped,
+      hasMore,
+    })
   } catch (error) {
     const code = error instanceof Error && 'code' in error ? error.code : undefined
     res.status(code === 'session_not_found' ? 404 : 500).json({ error: error instanceof Error ? error.message : 'history_failed' })
@@ -1062,6 +1267,7 @@ app.post('/api/sessions/:sessionId/message', async (req, res) => {
   try {
     const session = await resolveSession(req.params.sessionId)
     const result = await runGatewayCall('chat.send', { sessionKey: session.key, message, idempotencyKey: crypto.randomUUID() })
+    invalidateHistoryCacheForSessionKey(session.key)
     res.json({ ok: true, sessionKey: session.key, result })
   } catch (error) {
     const code = error instanceof Error && 'code' in error ? error.code : undefined
@@ -1073,6 +1279,7 @@ app.post('/api/sessions/:sessionId/abort', async (req, res) => {
   try {
     const session = await resolveSession(req.params.sessionId)
     const result = await runGatewayCall('chat.abort', { sessionKey: session.key, idempotencyKey: crypto.randomUUID() })
+    invalidateHistoryCacheForSessionKey(session.key)
     res.json({ ok: true, sessionKey: session.key, result })
   } catch (error) {
     const code = error instanceof Error && 'code' in error ? error.code : undefined
@@ -1101,6 +1308,8 @@ app.delete('/api/sessions/:sessionId', async (req, res) => {
   try {
     const session = await resolveSession(req.params.sessionId)
     const result = await runGatewayCall('sessions.delete', { key: session.key })
+    invalidateHistoryCacheForSessionKey(session.key)
+    invalidateSessionsListCache()
     res.json({ ok: true, sessionKey: session.key, result })
   } catch (error) {
     const code = error instanceof Error && 'code' in error ? error.code : undefined
@@ -1142,8 +1351,12 @@ wss.on('connection', (ws) => {
       if (data.type === 'subscribe' && typeof data.sessionId === 'string') {
         const session = await resolveSession(data.sessionId)
         await gatewayBridge.subscribe(clientId, data.sessionId, session.key)
-        const history = await runGatewayCall('chat.history', { sessionKey: session.key, limit: 200 })
-        const mappedMessages = mapHistoryMessages(data.sessionId, history)
+        const { messages: mappedMessages, hasMore: batchHasMore } = await loadHistoryMappedForSession(
+          data.sessionId,
+          session.key,
+          HISTORY_PAGE_DEFAULT,
+          undefined,
+        )
         gatewayBridge.setSnapshot(session.key, mappedMessages)
         const timeline = {
           events: mappedMessages.map((message) => toTimelineMessageEvent(message, data.sessionId, session.key)),
@@ -1170,6 +1383,7 @@ wss.on('connection', (ws) => {
           sessionKey: session.key,
           replace: true,
           messages: mappedMessages,
+          hasMore: batchHasMore,
         })
         sendWs(ws, {
           type: 'timeline.snapshot',
