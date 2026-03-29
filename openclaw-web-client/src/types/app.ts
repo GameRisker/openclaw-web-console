@@ -15,6 +15,8 @@ export type ConnectionStatus =
 
 export type SessionListStatus = 'idle' | 'loading' | 'loaded' | 'empty' | 'error'
 
+export type AgentListStatus = 'idle' | 'loading' | 'loaded' | 'empty' | 'error' | 'unsupported'
+
 export type HistoryStatus = 'idle' | 'loading-history' | 'ready' | 'error'
 
 export type SendStatus =
@@ -29,6 +31,18 @@ export type SendStatus =
 export type ToolActivityStatus = 'idle' | 'running' | 'failed' | 'stopped' | 'completed'
 
 export type SessionState = 'active' | 'idle' | 'busy' | 'error'
+
+export interface AgentItem {
+  id: string
+  key?: string
+  summary: string
+  subtitle?: string
+  state: SessionState
+  createdAt?: number
+  updatedAt?: number
+  model?: string
+  modelProvider?: string
+}
 
 export interface SessionItem {
   id: string
@@ -60,7 +74,10 @@ export interface AppState {
   authStatus: AuthStatus
   connectionStatus: ConnectionStatus
   sessionListStatus: SessionListStatus
+  agentListStatus: AgentListStatus
   activeSessionId: string
+  /** 侧栏树中当前选中的 Agent 槽位（与 session.key 的 agent:<槽位>: 段对应） */
+  activeAgentId: string
   /** 是否还可能存在更早历史（用于向上滚动分页） */
   historyHasMore: boolean
   /** 正在请求更早一页 */

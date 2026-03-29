@@ -1,4 +1,6 @@
 export { SessionListPanel, type SessionListPanelProps } from './SessionListPanel'
+export { SessionAgentTreePanel, type SessionAgentTreePanelProps } from './SessionAgentTreePanel'
 export { RenameSessionDialog, type RenameSessionDialogProps } from './RenameSessionDialog'
 export { DeleteSessionConfirmModal, type DeleteSessionConfirmModalProps } from './DeleteSessionConfirmModal'
+export { DeleteAgentConfirmModal, type DeleteAgentConfirmModalProps } from './DeleteAgentConfirmModal'
 export { formatSessionRelativeTime } from './formatRelativeTime'

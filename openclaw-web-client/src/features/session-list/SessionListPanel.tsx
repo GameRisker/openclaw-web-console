@@ -5,7 +5,6 @@ export type SessionListPanelProps = {
   sessions: SessionItem[]
   activeSessionId: string
   onSelectSession: (sessionId: string) => void
-  onCollapseSidebar: () => void
   onRefreshSessions: () => void
   /** 由上层决定如何弹窗/校验并创建 */
   onRequestCreateSession: () => void | Promise<void>
@@ -23,37 +22,15 @@ export function SessionListPanel({
   sessions,
   activeSessionId,
   onSelectSession,
-  onCollapseSidebar,
   onRefreshSessions,
   onRequestCreateSession,
   onBeginRenameSession,
   onRequestDeleteSession,
 }: SessionListPanelProps) {
   return (
-    <aside className="panel sidebar-panel">
-      <div className="panel-header compact-sidebar-header">
-        <div className="sidebar-panel-title">
-          <h2>Sessions</h2>
-        </div>
-        <div className="panel-header-actions sidebar-panel-toolbar">
-          <button type="button" className="icon-button sidebar-icon-btn" onClick={onCollapseSidebar} title="收起列表">
-            ◀
-          </button>
-          <button type="button" className="icon-button sidebar-icon-btn" onClick={onRefreshSessions} title="刷新历史">
-            ↻
-          </button>
-          <button
-            type="button"
-            className="icon-button sidebar-icon-btn"
-            title="新建会话"
-            onClick={() => void onRequestCreateSession()}
-          >
-            ＋
-          </button>
-        </div>
-      </div>
-
-      <div className="session-list compact-session-list">
+    <div className="sidebar-panel-section">
+      <h2 className="sr-only">Sessions</h2>
+      <div className="session-list compact-session-list sidebar-panel-list-body">
         {sessions.map((session) => (
           <article
             key={session.id}
@@ -100,6 +77,19 @@ export function SessionListPanel({
           </article>
         ))}
       </div>
-    </aside>
+      <div className="sidebar-list-footer" role="toolbar" aria-label="会话列表操作">
+        <button type="button" className="icon-button sidebar-icon-btn" onClick={onRefreshSessions} title="刷新历史">
+          ↻
+        </button>
+        <button
+          type="button"
+          className="icon-button sidebar-icon-btn"
+          title="新建会话"
+          onClick={() => void onRequestCreateSession()}
+        >
+          ＋
+        </button>
+      </div>
+    </div>
   )
 }

@@ -1,30 +1,38 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   abortSessionRun,
+  createAgent,
   createSession,
+  deleteAgent,
   deleteSession,
+  fetchAgents,
   fetchSessionHistory,
   fetchSessions,
   fetchStatus,
   compactSession,
+  patchAgent as requestPatchAgent,
   patchSessionSettings,
   renameSession,
   sendSessionMessage,
+  type CreateAgentPayload,
   type SessionPatchPayload,
 } from './api'
 import { connectRealtime } from './realtime'
 import { openclawWebLog } from './debugLog'
-import type { RealtimeEvent, ApiMessage, ApiSession, TimelineRenderItem, TimelineEventItem } from '../types/api'
-import type { AppState, HistoryStatus, SessionItem, SideCard } from '../types/app'
+import type { RealtimeEvent, ApiMessage, ApiAgent, ApiSession, TimelineRenderItem, TimelineEventItem } from '../types/api'
+import type { AgentItem, AppState, HistoryStatus, SessionItem, SideCard } from '../types/app'
 import { formatContextUsageLine } from '../utils/formatTokens'
 import { isUserFacingRole, timelineItemLooksLikeUserMessage } from '../utils/roles'
 import { HISTORY_FETCH_MAX, HISTORY_OLDER_STEP, HISTORY_PAGE_SIZE } from '../constants/history'
+import { agentSlotFromSessionKey } from '../utils/agentSession'
 
 const initialState: AppState = {
   authStatus: 'authenticated',
   connectionStatus: 'connecting',
   sessionListStatus: 'loading',
+  agentListStatus: 'loading',
   activeSessionId: '',
+  activeAgentId: '',
   historyHasMore: false,
   historyLoadingOlder: false,
   historyStatus: 'loading-history',
@@ -46,6 +54,54 @@ function mapSessionState(raw: string): SessionItem['state'] {
   if (raw === 'busy') return 'busy'
   if (raw === 'error') return 'error'
   return 'idle'
+}
+
+function mapAgentStateFromApi(raw?: string): AgentItem['state'] {
+  if (!raw) return 'idle'
+  const s = String(raw).trim().toLowerCase()
+  if (['active', 'online', 'running'].includes(s)) return 'active'
+  if (['busy', 'working'].includes(s)) return 'busy'
+  if (['error', 'failed'].includes(s)) return 'error'
+  if (['idle', 'offline', 'stopped', 'inactive'].includes(s)) return 'idle'
+  return 'idle'
+}
+
+function sortAgentsByUpdatedDesc(a: AgentItem, b: AgentItem) {
+  const ua = a.updatedAt ?? a.createdAt ?? 0
+  const ub = b.updatedAt ?? b.createdAt ?? 0
+  if (ub !== ua) return ub - ua
+  return String(a.id).localeCompare(String(b.id))
+}
+
+function mapApiAgentToItem(agent: ApiAgent): AgentItem {
+  const id = String(agent.agentId ?? agent.id ?? agent.key ?? '').trim()
+  const key = agent.key
+  const summary =
+    agent.label?.trim() ||
+    agent.displayName?.trim() ||
+    agent.name?.trim() ||
+    (id ? id : 'agent')
+  const subtitle =
+    [agent.modelProvider, agent.model].filter(Boolean).join('/') ||
+    agent.description?.trim() ||
+    key ||
+    'agent'
+  const updatedAt =
+    typeof agent.updatedAt === 'number' ? agent.updatedAt : toTimestampMs(String(agent.updatedAt ?? ''))
+  const createdFromApi = typeof agent.createdAt === 'number' ? agent.createdAt : undefined
+  const createdAt =
+    createdFromApi && createdFromApi > 0 ? createdFromApi : updatedAt > 0 ? updatedAt : Date.now()
+  return {
+    id: id || summary,
+    key,
+    summary,
+    subtitle,
+    state: mapAgentStateFromApi(agent.status ?? agent.state),
+    createdAt,
+    updatedAt: updatedAt > 0 ? updatedAt : createdAt,
+    model: agent.model,
+    modelProvider: agent.modelProvider,
+  }
 }
 
 /** 按创建时间新→旧；选中会话只改 state，不再重排 */
@@ -441,11 +497,13 @@ function cloneRenderItemsForCache(items: TimelineRenderItem[]): TimelineRenderIt
 export function useAppState() {
   const [state, setState] = useState<AppState>(initialState)
   const [sessions, setSessions] = useState<SessionItem[]>([])
+  const [agents, setAgents] = useState<AgentItem[]>([])
   const [messages, setMessages] = useState<ApiMessage[]>([])
   const [_timelineEvents, setTimelineEvents] = useState<TimelineEventItem[]>([])
   const [renderItems, setRenderItems] = useState<TimelineRenderItem[]>([])
   const realtimeRef = useRef<ReturnType<typeof connectRealtime> | null>(null)
   const activeSessionIdRef = useRef(state.activeSessionId)
+  const activeAgentIdRef = useRef(state.activeAgentId)
   const messagesRef = useRef<ApiMessage[]>([])
   const renderItemsRef = useRef<TimelineRenderItem[]>([])
   const refreshHistoryTimerRef = useRef<number | null>(null)
@@ -467,6 +525,7 @@ export function useAppState() {
    */
   sessionsRef.current = sessions
   activeSessionIdRef.current = state.activeSessionId
+  activeAgentIdRef.current = state.activeAgentId
   messagesRef.current = messages
   renderItemsRef.current = renderItems
   historyHasMoreRef.current = state.historyHasMore
@@ -570,6 +629,43 @@ export function useAppState() {
     }))
 
     return normalizedSessions
+  }
+
+  async function refreshAgents(preferredAgentId?: string) {
+    setState((prev) => ({ ...prev, agentListStatus: 'loading' }))
+    try {
+      const result = await fetchAgents()
+      if (result.unsupported) {
+        setAgents([])
+        setState((prev) => ({
+          ...prev,
+          agentListStatus: 'unsupported',
+          activeAgentId: '',
+        }))
+        return
+      }
+      const mapped = result.agents.map((a) => mapApiAgentToItem(a)).sort(sortAgentsByUpdatedDesc)
+      setAgents(mapped)
+      setState((prev) => {
+        let nextAgentId = ''
+        const pref = preferredAgentId?.trim()
+        if (pref && mapped.some((x) => x.id === pref)) nextAgentId = pref
+        else if (prev.activeAgentId && mapped.some((x) => x.id === prev.activeAgentId)) nextAgentId = prev.activeAgentId
+        else if (mapped.length > 0) nextAgentId = mapped[0]!.id
+        return {
+          ...prev,
+          agentListStatus: mapped.length ? 'loaded' : 'empty',
+          activeAgentId: nextAgentId,
+        }
+      })
+    } catch {
+      setAgents([])
+      setState((prev) => ({
+        ...prev,
+        agentListStatus: 'error',
+        activeAgentId: '',
+      }))
+    }
   }
 
   async function refreshHistory(sessionId: string, mode: 'replace' | 'merge-tail' = 'replace') {
@@ -782,11 +878,13 @@ export function useAppState() {
           connectionStatus: 'connected',
           runtimeNote: 'gateway ready',
         }))
+        await refreshAgents()
       } catch {
         setState((prev) => ({
           ...prev,
           connectionStatus: 'error',
           sessionListStatus: 'error',
+          agentListStatus: 'idle',
           runtimeNote: 'bootstrap failed',
         }))
       }
@@ -1114,6 +1212,7 @@ export function useAppState() {
     }
   }, [state.activeSessionId, state.sessionListStatus])
 
+  /** 侧栏树搜索：仅按会话 id/标题过滤；Agent 行仍展示，子列表变短 */
   const filteredSessions = useMemo(() => {
     const q = state.sessionSearch.trim().toLowerCase()
     if (!q) return sessions
@@ -1125,9 +1224,7 @@ export function useAppState() {
   }, [sessions, state.sessionSearch])
 
   const activeSession = useMemo<SessionItem>(() => {
-    const match =
-      filteredSessions.find((session) => session.id === state.activeSessionId) ??
-      sessions.find((session) => session.id === state.activeSessionId)
+    const match = sessions.find((session) => session.id === state.activeSessionId)
     if (match) return match
 
     const idle: SessionItem = { id: '', summary: '', state: 'idle' }
@@ -1138,7 +1235,20 @@ export function useAppState() {
       return { ...idle, summary: '会话列表加载失败' }
     }
     return { ...idle, summary: '暂无会话，请新建会话' }
-  }, [filteredSessions, sessions, state.activeSessionId, state.sessionListStatus])
+  }, [sessions, state.activeSessionId, state.sessionListStatus])
+
+  const activeAgent = useMemo((): AgentItem | null => {
+    if (!state.activeAgentId) return null
+    const found = agents.find((a) => a.id === state.activeAgentId)
+    if (found) return found
+    const id = state.activeAgentId
+    return {
+      id,
+      summary: id === '_other' ? '其他会话' : id,
+      subtitle: 'agent',
+      state: 'idle',
+    }
+  }, [agents, state.activeAgentId])
 
   const currentDraft = state.draftBySession[state.activeSessionId] ?? ''
 
@@ -1173,21 +1283,44 @@ export function useAppState() {
     const runtimeItems = [
       'Host: Dan-MacBook',
       `Gateway: ${state.connectionStatus}`,
-      `Sessions: ${sessions.length}`,
+      `Sessions: ${sessions.length}${
+        state.sessionSearch.trim() ? `（筛选 ${filteredSessions.length}）` : ''
+      }`,
+      `Agents: ${agents.length}`,
     ]
-    return [
+    const cards: SideCard[] = [
       { title: '当前会话', items: sessionItems },
       { title: '运行状态', items: runtimeItems },
     ]
+    if (activeAgent) {
+      const agentSummary =
+        activeAgent.summary.length > 52 ? `${activeAgent.summary.slice(0, 52)}…` : activeAgent.summary
+      cards.splice(1, 0, {
+        title: '当前 Agent',
+        items: [
+          `ID: ${activeAgent.id}`,
+          agentSummary,
+          `State: ${activeAgent.state}`,
+          ...(activeAgent.model
+            ? [`Model: ${activeAgent.modelProvider ? `${activeAgent.modelProvider}/` : ''}${activeAgent.model}`]
+            : []),
+        ],
+      })
+    }
+    return cards
   }, [
+    activeAgent,
     activeSession.contextTokens,
     activeSession.id,
     activeSession.state,
     activeSession.summary,
     activeSession.totalTokens,
+    agents.length,
     displayMessages.length,
+    filteredSessions.length,
     sessions.length,
     state.connectionStatus,
+    state.sessionSearch,
   ])
 
   /** 网关先报 completed 时气泡可能仍为 running；等无 running 后再清计时起点并写入 lastRunDurationMs */
@@ -1531,20 +1664,93 @@ export function useAppState() {
     }
   }
 
+  /** 删除 OpenClaw 中的 Agent（无 UI 确认）；成功返回 true */
+  async function removeAgent(slot: string): Promise<boolean> {
+    try {
+      const keepSessionId = activeSessionIdRef.current || undefined
+      const preferredAgentId =
+        activeAgentIdRef.current === slot ? undefined : activeAgentIdRef.current || undefined
+
+      await deleteAgent(slot)
+      await refreshSessions(keepSessionId)
+      await refreshAgents(preferredAgentId)
+
+      const sid = activeSessionIdRef.current
+      if (sid) await refreshHistory(sid, 'replace')
+
+      setState((prev) => ({
+        ...prev,
+        runtimeNote: 'agent deleted',
+        composerError: undefined,
+      }))
+      return true
+    } catch (error) {
+      setState((prev) => ({
+        ...prev,
+        composerError: error instanceof Error ? error.message : 'delete_agent_failed',
+        runtimeNote: 'delete agent failed',
+      }))
+      return false
+    }
+  }
+
+  async function submitNewAgent(payload: CreateAgentPayload) {
+    const r = await createAgent(payload)
+    await refreshSessions(r.sessionId || undefined)
+    await refreshAgents(r.slot)
+    setState((prev) => ({
+      ...prev,
+      runtimeNote: 'agent created',
+      composerError: undefined,
+    }))
+  }
+
+  async function refreshSessionAgentTree() {
+    const sid = activeSessionIdRef.current || undefined
+    await refreshSessions(sid || undefined)
+    await refreshAgents(activeAgentIdRef.current || undefined)
+    if (sid) await refreshHistory(sid, 'replace')
+  }
+
+  /** 更新 Agent（agents.list + 该槽位下全部会话）；失败时抛出，便于弹窗展示错误 */
+  async function patchAgent(slot: string, patch: SessionPatchPayload) {
+    try {
+      await requestPatchAgent(slot, patch)
+      await refreshSessionAgentTree()
+      setState((prev) => ({
+        ...prev,
+        runtimeNote: 'agent patched',
+        composerError: undefined,
+      }))
+    } catch (error) {
+      setState((prev) => ({
+        ...prev,
+        composerError: error instanceof Error ? error.message : 'patch_agent_failed',
+        runtimeNote: 'patch agent failed',
+      }))
+      throw error
+    }
+  }
+
   return {
     state,
     filteredSessions,
+    agents,
     activeSession,
+    activeAgent,
     currentDraft,
     messages: displayMessages,
     modelSideStreaming,
     sideCards,
     setSessionSearch: (value: string) => setState((prev) => ({ ...prev, sessionSearch: value })),
     selectSession: (id: string) => {
+      const sess = sessionsRef.current.find((s) => s.id === id)
+      const slot = sess ? agentSlotFromSessionKey(sess.key) : ''
       setSessions((current) => touchSessionState(current, id, 'active'))
       setState((prev) => ({
         ...prev,
         activeSessionId: id,
+        activeAgentId: slot || prev.activeAgentId,
         composerError: undefined,
         sendStatus: 'idle',
         toolActivityStatus: 'idle',
@@ -1587,11 +1793,25 @@ export function useAppState() {
       if (!id) return
       void refreshHistory(id, 'replace')
     },
+    refreshAgents: (preferredAgentId?: string) => {
+      void refreshAgents(preferredAgentId)
+    },
+    selectAgent: (id: string) => {
+      setState((prev) => ({
+        ...prev,
+        activeAgentId: id,
+        runtimeNote: 'agent selected',
+      }))
+    },
+    submitNewAgent,
+    refreshSessionAgentTree,
     loadOlderHistory,
     createNewSession,
     commitRenameSession,
     patchActiveSessionSettings,
     compactActiveSession,
     removeSession,
+    removeAgent,
+    patchAgent,
   }
 }

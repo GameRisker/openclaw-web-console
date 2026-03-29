@@ -11,12 +11,15 @@ import {
   getSlashTokenAtCursor,
   type SlashCommand,
 } from '../lib/slashCommands'
+import { deriveAgentSettingsSnapshot } from '../utils/agentSession'
 import { isUserFacingRole } from '../utils/roles'
 import { formatContextUsageLine } from '../utils/formatTokens'
 import type { SideCard } from '../types/app'
 import type { ApiMessage } from '../types/api'
 import { ContextSessionSettings } from '../features/context-panel/ContextSessionSettings'
-import { DeleteSessionConfirmModal, RenameSessionDialog, SessionListPanel } from '../features/session-list'
+import { AddAgentDialog, AgentSettingsDialog } from '../features/agent-list'
+import { DeleteAgentConfirmModal, DeleteSessionConfirmModal, RenameSessionDialog } from '../features/session-list'
+import { LeftSidebarPanel } from '../features/left-sidebar'
 
 function getConnectionPillClass(status: string) {
   if (status === 'connected') return 'success'
@@ -422,23 +425,29 @@ export function AppShellPage() {
   const {
     state,
     filteredSessions,
+    agents,
     activeSession,
     currentDraft,
     messages,
     sideCards,
     selectSession,
+    selectAgent,
     toggleLeftSidebar,
     toggleRightSidebar,
     toggleSettings,
     setDraft,
     sendCurrentMessage,
-    refreshHistory,
     loadOlderHistory,
     createNewSession,
     commitRenameSession,
     patchActiveSessionSettings,
     compactActiveSession,
     removeSession,
+    removeAgent,
+    setSessionSearch,
+    submitNewAgent,
+    refreshSessionAgentTree,
+    patchAgent,
     modelSideStreaming,
   } = useAppState()
 
@@ -477,6 +486,16 @@ export function AppShellPage() {
   const [slashParentForSubmenu, setSlashParentForSubmenu] = useState<SlashCommand | null>(null)
   const [sessionRename, setSessionRename] = useState<{ id: string; initial: string } | null>(null)
   const [sessionDeleteConfirm, setSessionDeleteConfirm] = useState<{ id: string; summary: string } | null>(null)
+  const [agentDeleteConfirm, setAgentDeleteConfirm] = useState<{ slot: string; title: string } | null>(null)
+  const [agentSettingsDraft, setAgentSettingsDraft] = useState<{
+    slot: string
+    label: string
+    model?: string
+    modelProvider?: string
+    verbose?: boolean
+    think?: string
+  } | null>(null)
+  const [addAgentOpen, setAddAgentOpen] = useState(false)
   const [appToast, setAppToast] = useState<{ text: string; kind: 'success' | 'error' } | null>(null)
 
   useEffect(() => {
@@ -879,6 +898,31 @@ export function AppShellPage() {
           await commitRenameSession(sessionId, label)
         }}
       />
+      <AddAgentDialog
+        open={addAgentOpen}
+        onDismiss={() => setAddAgentOpen(false)}
+        onSubmit={async (payload) => {
+          await submitNewAgent(payload)
+          setAppToast({ text: 'Agent 已创建，已切换到 Sessions', kind: 'success' })
+        }}
+      />
+      {agentSettingsDraft != null && (
+        <AgentSettingsDialog
+          open
+          slot={agentSettingsDraft.slot}
+          label={agentSettingsDraft.label}
+          model={agentSettingsDraft.model}
+          modelProvider={agentSettingsDraft.modelProvider}
+          verbose={agentSettingsDraft.verbose}
+          think={agentSettingsDraft.think}
+          onDismiss={() => setAgentSettingsDraft(null)}
+          onSave={async (patch) => {
+            await patchAgent(agentSettingsDraft.slot, patch)
+            setAppToast({ text: 'Agent 设置已保存', kind: 'success' })
+          }}
+          onRequestDeleteAgent={(slot, displayTitle) => setAgentDeleteConfirm({ slot, title: displayTitle })}
+        />
+      )}
       <DeleteSessionConfirmModal
         open={sessionDeleteConfirm != null}
         sessionId={sessionDeleteConfirm?.id ?? ''}
@@ -887,6 +931,18 @@ export function AppShellPage() {
         performDelete={removeSession}
         onDeleted={() => setAppToast({ text: '会话已删除', kind: 'success' })}
         onDeleteFailed={() => setAppToast({ text: '删除失败，请查看上方错误信息或稍后重试', kind: 'error' })}
+      />
+      <DeleteAgentConfirmModal
+        open={agentDeleteConfirm != null}
+        agentSlot={agentDeleteConfirm?.slot ?? ''}
+        agentTitle={agentDeleteConfirm?.title ?? ''}
+        onDismiss={() => setAgentDeleteConfirm(null)}
+        performDelete={removeAgent}
+        onDeleted={() => {
+          setAppToast({ text: 'Agent 已删除', kind: 'success' })
+          setAgentSettingsDraft(null)
+        }}
+        onDeleteFailed={() => setAppToast({ text: '删除 Agent 失败，请查看上方错误信息或稍后重试', kind: 'error' })}
       />
       {appToast && (
         <div className={`app-toast app-toast--${appToast.kind}`} role="status" aria-live="polite">
@@ -920,23 +976,35 @@ export function AppShellPage() {
         className={`console-grid ${state.isLeftSidebarCollapsed ? 'left-collapsed' : ''} ${state.isRightSidebarCollapsed ? 'right-collapsed' : ''}`}
       >
         {!state.isLeftSidebarCollapsed && (
-          <SessionListPanel
-            sessions={filteredSessions}
-            activeSessionId={activeSession.id}
-            onSelectSession={selectSession}
+          <LeftSidebarPanel
             onCollapseSidebar={toggleLeftSidebar}
-            onRefreshSessions={refreshHistory}
-            onRequestCreateSession={async () => {
-              const nextName = window.prompt('Session name')?.trim()
-              if (!nextName) return
-              await createNewSession(nextName)
+            tree={{
+              sessions: filteredSessions,
+              agents,
+              agentListStatus: state.agentListStatus,
+              activeSessionId: state.activeSessionId,
+              activeAgentId: state.activeAgentId,
+              sessionSearch: state.sessionSearch,
+              onSessionSearchChange: setSessionSearch,
+              onSelectSession: selectSession,
+              onSelectAgent: selectAgent,
+              onRefreshTree: refreshSessionAgentTree,
+              onRequestCreateSession: async () => {
+                const nextName = window.prompt('Session name')?.trim()
+                if (!nextName) return
+                await createNewSession(nextName)
+              },
+              onRequestAddAgent: () => setAddAgentOpen(true),
+              onBeginRenameSession: (sessionId, currentTitle) =>
+                setSessionRename({ id: sessionId, initial: currentTitle }),
+              onRequestDeleteSession: (sessionId, summary) =>
+                setSessionDeleteConfirm({ id: sessionId, summary }),
+              onOpenAgentSettings: (slot) =>
+                setAgentSettingsDraft({
+                  slot,
+                  ...deriveAgentSettingsSnapshot(slot, agents, filteredSessions),
+                }),
             }}
-            onBeginRenameSession={(sessionId, currentTitle) =>
-              setSessionRename({ id: sessionId, initial: currentTitle })
-            }
-            onRequestDeleteSession={(sessionId, summary) =>
-              setSessionDeleteConfirm({ id: sessionId, summary })
-            }
           />
         )}
 

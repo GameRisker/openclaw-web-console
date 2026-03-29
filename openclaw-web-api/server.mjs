@@ -17,7 +17,19 @@ const execFileAsync = promisify(execFile)
 const app = express()
 const PORT = Number(process.env.PORT || 3001)
 const HOST = process.env.HOST || '0.0.0.0'
-const CONFIG_PATH = path.join(os.homedir(), '.openclaw', 'openclaw.json')
+/** 与 OpenClaw CLI 一致：可用 OPENCLAW_CONFIG_PATH 覆盖默认 ~/.openclaw/openclaw.json */
+function getOpenClawConfigPath() {
+  const raw = process.env.OPENCLAW_CONFIG_PATH?.trim()
+  if (raw) return path.isAbsolute(raw) ? raw : path.join(os.homedir(), raw)
+  return path.join(os.homedir(), '.openclaw', 'openclaw.json')
+}
+
+/** 状态根目录（agents、workspace-* 等）；默认 ~/.openclaw，可由 OPENCLAW_STATE_DIR 覆盖 */
+function getOpenClawStateDir() {
+  const raw = process.env.OPENCLAW_STATE_DIR?.trim()
+  if (raw) return path.isAbsolute(raw) ? raw : path.join(os.homedir(), raw)
+  return path.join(os.homedir(), '.openclaw')
+}
 
 /**
  * WS 订阅首包 / 未传 limit 时的默认条数。
@@ -326,7 +338,7 @@ async function loadModelsCatalogPayload() {
 }
 
 async function loadGatewayConfig() {
-  const raw = await fs.readFile(CONFIG_PATH, 'utf8')
+  const raw = await fs.readFile(getOpenClawConfigPath(), 'utf8')
   const config = JSON.parse(raw)
   const auth = config.gateway?.auth ?? {}
   const port = config.gateway?.port || 8080
@@ -528,6 +540,125 @@ function toTimestampMs(value) {
   if (Number.isFinite(numeric) && numeric > 0) return numeric
   const parsed = Date.parse(String(value || ''))
   return Number.isFinite(parsed) ? parsed : 0
+}
+
+/** sessionKey 形如 agent:<slot>:<suffix>（与 POST /api/sessions 创建逻辑一致） */
+function parseAgentSlotFromSessionKey(key) {
+  if (key == null || typeof key !== 'string') return null
+  const m = /^agent:([^:]+):/.exec(key.trim())
+  return m ? m[1] : null
+}
+
+function normalizeAgentListItem(item) {
+  if (!item || typeof item !== 'object') return null
+  const id = item.agentId ?? item.id ?? item.key
+  if (id == null || String(id).trim() === '') return null
+  const agentId = String(item.agentId ?? item.id ?? id).trim()
+  return {
+    agentId,
+    id: String(item.id ?? item.agentId ?? agentId).trim(),
+    key: item.key,
+    name: item.name,
+    label: item.label,
+    displayName: item.displayName,
+    description: item.description,
+    status: item.status ?? item.state,
+    state: item.state,
+    updatedAt:
+      typeof item.updatedAt === 'number' && item.updatedAt > 0
+        ? item.updatedAt
+        : toTimestampMs(item.updatedAt),
+    createdAt:
+      typeof item.createdAt === 'number' && item.createdAt > 0
+        ? item.createdAt
+        : toTimestampMs(item.createdAt),
+    model: item.model,
+    modelProvider: item.modelProvider,
+  }
+}
+
+/** 网关未实现 agents.list 时，由 sessions.list 推导 Agent 槽位（与 OpenClaw sessionKey 约定一致） */
+function agentsDerivedFromSessionsList(result) {
+  const sessions = Array.isArray(result?.sessions) ? result.sessions : []
+  const bySlot = new Map()
+  for (const s of sessions) {
+    const slot = parseAgentSlotFromSessionKey(String(s.key ?? ''))
+    const bucketId = slot ?? '_other'
+    const updatedAt =
+      typeof s.updatedAt === 'number' && s.updatedAt > 0
+        ? s.updatedAt
+        : toTimestampMs(s.updatedAt)
+    const prev = bySlot.get(bucketId)
+    if (!prev) {
+      bySlot.set(bucketId, { sessionCount: 1, updatedAt, slot })
+    } else {
+      prev.sessionCount += 1
+      if (updatedAt > prev.updatedAt) prev.updatedAt = updatedAt
+    }
+  }
+  const agents = []
+  for (const [bucketId, pack] of bySlot) {
+    const isOther = bucketId === '_other'
+    agents.push({
+      agentId: bucketId,
+      id: bucketId,
+      label: isOther ? '其他会话' : bucketId,
+      displayName: isOther ? '非 agent:* 命名空间的会话' : `Agent · ${bucketId}`,
+      description: `${pack.sessionCount} 个会话`,
+      status: 'idle',
+      updatedAt: pack.updatedAt > 0 ? pack.updatedAt : Date.now(),
+    })
+  }
+  agents.sort(
+    (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0) || String(a.id).localeCompare(String(b.id)),
+  )
+  return agents
+}
+
+/**
+ * 网关 agents.list 若返回静态/不完整列表，会与 sessions 推导结果合并，避免 Web 新建的 agent:<slot>: 槽位不显示。
+ */
+function mergeAgentListsById(gatewayAgents, derivedAgents) {
+  const byId = new Map()
+
+  for (const d of derivedAgents) {
+    const id = String(d.agentId ?? d.id ?? '').trim()
+    if (!id) continue
+    byId.set(id, { ...d })
+  }
+
+  for (const g of gatewayAgents) {
+    const id = String(g.agentId ?? g.id ?? '').trim()
+    if (!id) continue
+    const prev = byId.get(id)
+    if (prev) {
+      const uG = Number(g.updatedAt) || 0
+      const uP = Number(prev.updatedAt) || 0
+      byId.set(id, {
+        agentId: id,
+        id,
+        label: g.label ?? g.displayName ?? prev.label,
+        displayName: g.displayName ?? prev.displayName,
+        description: g.description ?? prev.description,
+        status: g.status ?? g.state ?? prev.status,
+        state: g.state ?? prev.state,
+        model: g.model ?? prev.model,
+        modelProvider: g.modelProvider ?? prev.modelProvider,
+        key: g.key ?? prev.key,
+        name: g.name ?? prev.name,
+        updatedAt: Math.max(uG, uP) || prev.updatedAt,
+        createdAt: g.createdAt ?? prev.createdAt,
+      })
+    } else {
+      byId.set(id, g)
+    }
+  }
+
+  const merged = [...byId.values()]
+  merged.sort(
+    (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0) || String(a.id).localeCompare(String(b.id)),
+  )
+  return merged
 }
 
 function flattenContent(content, parentRole = 'assistant') {
@@ -1555,6 +1686,190 @@ app.get('/api/sessions', async (_req, res) => {
   }
 })
 
+app.get('/api/agents', async (_req, res) => {
+  try {
+    /** 列表页需立即看到新建槽位，避免与 sessions 缓存 TTL 竞态，此处强制拉最新 sessions.list */
+    const result = await listSessions()
+    const derived = agentsDerivedFromSessionsList(result)
+
+    let gatewayAgents = []
+    try {
+      const raw = await runGatewayCall('agents.list', {}, 8000)
+      if (raw && Array.isArray(raw.agents)) {
+        gatewayAgents = raw.agents.map(normalizeAgentListItem).filter(Boolean)
+      }
+    } catch (e) {
+      bridgeLog('api.agents.gateway_list_skipped', {
+        reason: e instanceof Error ? e.message : String(e),
+      })
+    }
+
+    const agents = mergeAgentListsById(gatewayAgents, derived)
+    res.json({ count: agents.length, agents })
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'agents_failed' })
+  }
+})
+
+/**
+ * 新建 Agent：创建 agent:<slot>:tui-* 会话，可选写入 label / model / verbose / think（与 sessions.patch 同源）。
+ * description 若有内容则写入该 Agent workspace 根目录下 AGENTS.md（默认 ~/.openclaw/workspace-<slot>/AGENTS.md），不再拼进首条引导消息。
+ * body: slot | agentId, label?, displayName?, description?, bootstrapMessage? | message?, model?, modelProvider?, verbose?, think?
+ */
+app.post('/api/agents', async (req, res) => {
+  const slot = sanitizeAgentSlot(req.body?.slot ?? req.body?.agentId)
+  if (!slot) {
+    return res.status(400).json({
+      error: 'invalid_agent_slot',
+      message: '槽位须为 1–64 字符：字母或数字开头，仅含 . _ -；不可用保留名 _other',
+    })
+  }
+
+  const label =
+    String(req.body?.label ?? '').trim() ||
+    String(req.body?.displayName ?? '').trim() ||
+    slot
+  const description = String(req.body?.description ?? '').trim()
+  const bootstrapMessage =
+    String(req.body?.bootstrapMessage ?? req.body?.message ?? 'Start a new session.').trim() || 'Start a new session.'
+
+  const sessionKey = `agent:${slot}:tui-${crypto.randomUUID()}`
+
+  try {
+    const model = String(req.body?.model ?? '').trim()
+    const modelProvider = String(req.body?.modelProvider ?? '').trim()
+    const thinkRaw = String(req.body?.think ?? '').trim().toLowerCase()
+    const register = await registerAgentInOpenClawConfig({
+      slot,
+      label,
+      model,
+      modelProvider,
+    })
+
+    const descriptionPath = await writeAgentDescriptionMarkdown(slot, description)
+
+    invalidateSessionsListCache()
+    await runGatewayCall('agent', {
+      sessionKey,
+      message: bootstrapMessage,
+      idempotencyKey: crypto.randomUUID(),
+    })
+
+    const patch = { label }
+    if (model) patch.model = model
+    if (modelProvider) patch.modelProvider = modelProvider
+    if (req.body?.verbose === true || req.body?.verbose === false) patch.verbose = req.body.verbose
+    if (thinkRaw === 'low' || thinkRaw === 'high' || thinkRaw === 'off') patch.think = thinkRaw
+
+    await applyGatewaySessionPreferencePatch(sessionKey, patch)
+
+    invalidateSessionsListCache()
+    const list = await listSessions()
+    const row = list.sessions.find((s) => String(s.key ?? '') === sessionKey)
+    const sessionId = row?.sessionId != null ? String(row.sessionId) : null
+    res.json({
+      ok: true,
+      sessionKey,
+      slot,
+      agentId: slot,
+      sessionId,
+      label,
+      register,
+      ...(descriptionPath ? { descriptionPath } : {}),
+    })
+  } catch (error) {
+    res.status(500).json({
+      error: 'create_agent_failed',
+      message: error instanceof Error ? error.message : 'create_agent_failed',
+    })
+  }
+})
+
+/** 删除 Agent：优先 CLI（与 openclaw agents delete 一致），失败再试网关 agents.delete */
+app.delete('/api/agents/:slot', async (req, res) => {
+  const slot = sanitizeAgentSlot(req.params.slot)
+  if (!slot) {
+    return res.status(400).json({
+      error: 'invalid_agent_slot',
+      message: '槽位须为 1–64 字符：字母或数字开头，仅含 . _ -；不可用保留名 _other',
+    })
+  }
+  try {
+    try {
+      await execFileAsync('openclaw', ['agents', 'delete', slot, '--force', '--json'], {
+        env: process.env,
+        maxBuffer: 10 * 1024 * 1024,
+      })
+      invalidateSessionsListCache()
+      return res.json({ ok: true, via: 'openclaw.agents.delete', slot })
+    } catch (cliErr) {
+      try {
+        await runGatewayCall('agents.delete', { id: slot }, 20000)
+        invalidateSessionsListCache()
+        return res.json({ ok: true, via: 'gateway.agents.delete', slot })
+      } catch {
+        throw cliErr
+      }
+    }
+  } catch (error) {
+    res.status(500).json({
+      error: 'delete_agent_failed',
+      message: error instanceof Error ? error.message : 'delete_agent_failed',
+      slot,
+    })
+  }
+})
+
+/**
+ * 更新 Agent：写入 agents.list（名称/模型）并对该槽位下所有会话执行与 POST /api/sessions/:id/patch 相同的网关 patch。
+ * body 白名单与会话 patch 一致：label, model, modelProvider, verbose, think
+ */
+app.patch('/api/agents/:slot', async (req, res) => {
+  const slot = sanitizeAgentSlot(req.params.slot)
+  if (!slot) {
+    return res.status(400).json({
+      error: 'invalid_agent_slot',
+      message: '槽位须为 1–64 字符：字母或数字开头，仅含 . _ -；不可用保留名 _other',
+    })
+  }
+
+  const built = buildSessionPatchPayloadStrict(req.body)
+  if (built.error) {
+    return res.status(built.error.status).json({
+      error: built.error.code,
+      message: built.error.message,
+    })
+  }
+
+  try {
+    const configMeta = await updateAgentEntryInOpenClawConfig(slot, built.patch)
+    const sessionsResult = await listSessions()
+    const rawSessions = Array.isArray(sessionsResult?.sessions) ? sessionsResult.sessions : []
+    const patchedKeys = []
+    for (const s of rawSessions) {
+      const key = String(s?.key ?? '')
+      if (parseAgentSlotFromSessionKey(key) !== slot) continue
+      await applyGatewaySessionPreferencePatch(key, built.patch)
+      patchedKeys.push(key)
+    }
+    invalidateSessionsListCache()
+    res.json({
+      ok: true,
+      slot,
+      patch: built.patch,
+      config: configMeta,
+      sessionKeysPatched: patchedKeys,
+      sessionsPatched: patchedKeys.length,
+    })
+  } catch (error) {
+    res.status(500).json({
+      error: 'patch_agent_failed',
+      message: error instanceof Error ? error.message : 'patch_agent_failed',
+      slot,
+    })
+  }
+})
+
 app.post('/api/sessions', async (req, res) => {
   try {
     const sessionKey = `agent:main:tui-${crypto.randomUUID()}`
@@ -1731,6 +2046,336 @@ function gatewaySessionPatchParams(sessionKey, core) {
   return { key: sessionKey, ...core }
 }
 
+/** 对已知 sessionKey 应用 label/model/verbose/think（与 POST /api/sessions/:id/patch 一致） */
+async function applyGatewaySessionPreferencePatch(sessionKey, patch) {
+  const { core, slashMessages } = splitPatchForGateway(patch)
+  let result
+  if (Object.keys(core).length > 0) {
+    result = await runGatewayCall('sessions.patch', gatewaySessionPatchParams(sessionKey, core))
+  }
+  for (const message of slashMessages) {
+    result = await runGatewayCall(
+      'chat.send',
+      { sessionKey, message, idempotencyKey: crypto.randomUUID() },
+      60000,
+    )
+    invalidateHistoryCacheForSessionKey(sessionKey)
+  }
+  return result
+}
+
+/**
+ * 与 `openclaw agents add --workspace` 一致：$OPENCLAW_STATE_DIR/workspace-<slot>
+ */
+function defaultAgentWorkspaceDirAbs(slot) {
+  return path.join(getOpenClawStateDir(), `workspace-${slot}`)
+}
+
+/**
+ * 描述非空时写入 Markdown：位于该 Agent workspace 根目录
+ * $OPENCLAW_STATE_DIR/workspace-<slot>/AGENTS.md（与 agents add 的 --workspace 路径一致）。
+ * 目录不存在则递归创建。
+ * @returns {Promise<string|null>} 成功写入的绝对路径；描述为空则 null
+ */
+async function writeAgentDescriptionMarkdown(slot, description) {
+  const text = String(description ?? '').trim()
+  if (!text) return null
+  const workspaceAbs = defaultAgentWorkspaceDirAbs(slot)
+  await fs.mkdir(workspaceAbs, { recursive: true })
+  const filePath = path.resolve(workspaceAbs, 'AGENTS.md')
+  await fs.writeFile(filePath, `${text}\n`, 'utf8')
+  bridgeLog('api.agents.agents_md_written', { slot, filePath })
+  return filePath
+}
+
+/** Web 侧 Agent 槽位：写入 sessionKey 的 agent:<slot>:… 段，须安全且与列表推导一致 */
+function sanitizeAgentSlot(raw) {
+  const s = String(raw ?? '').trim()
+  if (!s) return null
+  if (s === '_other') return null
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(s)) return null
+  return s
+}
+
+function buildAgentConfigModelString(model, modelProvider) {
+  const m = String(model ?? '').trim()
+  const mp = String(modelProvider ?? '').trim()
+  if (mp && m) return `${mp}/${m}`
+  return m || mp || ''
+}
+
+function parseAgentsListFromConfigGetJson(parsed) {
+  if (Array.isArray(parsed)) return parsed
+  if (parsed && typeof parsed === 'object' && Array.isArray(parsed.value)) return parsed.value
+  if (parsed && typeof parsed === 'object' && Array.isArray(parsed.list)) return parsed.list
+  return null
+}
+
+/** 曾由 Web 桥接写入的字段，当前 OpenClaw schema 不认；写入 agents.list 前剥除以免整份 config 失效 */
+function stripUnsupportedAgentListKeys(list) {
+  if (!Array.isArray(list)) return []
+  return list.map((raw) => {
+    if (!raw || typeof raw !== 'object') return raw
+    const next = { ...raw }
+    delete next.thinkingLevel
+    return next
+  })
+}
+
+function parseOpenClawCliJsonLine(stdout) {
+  const text = String(stdout ?? '').trim()
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !line.startsWith('['))
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      return JSON.parse(lines[i])
+    } catch {
+      // continue
+    }
+  }
+  return null
+}
+
+/** 官方路径：创建独立 workspace / agentDir / agents.list 项（与文档 openclaw agents add 一致） */
+async function tryOpenClawAgentsAddCli({ slot, fullModel }) {
+  const workspaceAbs = defaultAgentWorkspaceDirAbs(slot)
+  const args = ['agents', 'add', slot, '--non-interactive', '--workspace', workspaceAbs]
+  if (fullModel) args.push('--model', fullModel)
+  args.push('--json')
+  try {
+    const { stdout } = await execFileAsync('openclaw', args, {
+      env: process.env,
+      maxBuffer: 10 * 1024 * 1024,
+    })
+    const cliResult = parseOpenClawCliJsonLine(stdout)
+    bridgeLog('api.agents.register_via_cli_add', { slot })
+    return { registered: true, via: 'openclaw.agents.add', cliResult }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    const stderr = e && typeof e === 'object' && 'stderr' in e ? String(e.stderr ?? '') : ''
+    const blob = `${msg}\n${stderr}`.toLowerCase()
+    if (
+      blob.includes('already') ||
+      blob.includes('exists') ||
+      blob.includes('duplicate') ||
+      blob.includes('eexist')
+    ) {
+      bridgeLog('api.agents.register_cli_add_exists', { slot })
+      return { registered: true, via: 'openclaw.agents.add.already_exists', skipped: true }
+    }
+    bridgeLog('api.agents.cli_add_failed', { slot, message: msg.slice(0, 400) })
+    return { registered: false }
+  }
+}
+
+async function tryOpenClawAgentSetIdentityName(slot, name) {
+  const n = String(name ?? '').trim()
+  if (!n || n === slot) return
+  try {
+    await execFileAsync(
+      'openclaw',
+      ['agents', 'set-identity', '--agent', slot, '--name', n, '--json'],
+      { env: process.env, maxBuffer: 10 * 1024 * 1024 },
+    )
+    bridgeLog('api.agents.set_identity_ok', { slot })
+  } catch (e) {
+    bridgeLog('api.agents.set_identity_skipped', {
+      slot,
+      message: e instanceof Error ? e.message : String(e),
+    })
+  }
+}
+
+async function readAgentsListFromOpenClaw() {
+  try {
+    const { stdout } = await execFileAsync(
+      'openclaw',
+      ['config', 'get', 'agents.list', '--json'],
+      { env: process.env, maxBuffer: 10 * 1024 * 1024 },
+    )
+    const text = String(stdout ?? '').trim()
+    if (!text) return []
+    const arr = parseAgentsListFromConfigGetJson(JSON.parse(text))
+    return arr ? stripUnsupportedAgentListKeys([...arr]) : []
+  } catch {
+    try {
+      const raw = await fs.readFile(getOpenClawConfigPath(), 'utf8')
+      const cfg = JSON.parse(raw)
+      return stripUnsupportedAgentListKeys(Array.isArray(cfg.agents?.list) ? [...cfg.agents.list] : [])
+    } catch {
+      return []
+    }
+  }
+}
+
+async function writeAgentsListToOpenClaw(newList) {
+  const stripped = stripUnsupportedAgentListKeys(newList)
+  const cfgPath = getOpenClawConfigPath()
+  try {
+    await execFileAsync(
+      'openclaw',
+      ['config', 'set', 'agents.list', JSON.stringify(stripped), '--strict-json'],
+      { env: process.env, maxBuffer: 10 * 1024 * 1024 },
+    )
+    return { via: 'openclaw.config.set' }
+  } catch (e1) {
+    bridgeLog('api.agents.write_list_config_set_failed', {
+      message: e1 instanceof Error ? e1.message : String(e1),
+    })
+    let cfg = {}
+    try {
+      cfg = JSON.parse(await fs.readFile(cfgPath, 'utf8'))
+    } catch {
+      cfg = {}
+    }
+    if (!cfg.agents || typeof cfg.agents !== 'object') cfg.agents = {}
+    cfg.agents.list = stripped
+    await fs.mkdir(path.dirname(cfgPath), { recursive: true })
+    await fs.writeFile(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8')
+    return { via: 'openclaw.json.direct' }
+  }
+}
+
+/** 按 patch 更新 agents.list 中对应 id（无该项则跳过）；返回是否写入配置 */
+async function updateAgentEntryInOpenClawConfig(slot, patch) {
+  const touchesConfig =
+    (patch.label != null && String(patch.label).trim() !== '') ||
+    (patch.model != null && String(patch.model).trim() !== '') ||
+    (patch.modelProvider != null && String(patch.modelProvider).trim() !== '')
+  if (!touchesConfig) {
+    return { configUpdated: false }
+  }
+
+  const list = await readAgentsListFromOpenClaw()
+  const idx = list.findIndex((a) => String(a?.id) === slot)
+  if (idx < 0) {
+    bridgeLog('api.agents.patch_config_skip_no_entry', { slot })
+    return { configUpdated: false, reason: 'no_config_entry' }
+  }
+
+  const entry = { ...list[idx] }
+  if (patch.label != null && String(patch.label).trim() !== '') {
+    const n = String(patch.label).trim()
+    entry.name = n
+    const prevId =
+      entry.identity && typeof entry.identity === 'object' && !Array.isArray(entry.identity) ? entry.identity : {}
+    entry.identity = { ...prevId, name: n }
+  }
+  const fullModel = buildAgentConfigModelString(patch.model ?? '', patch.modelProvider ?? '')
+  if (fullModel) entry.model = fullModel
+
+  const newList = [...list]
+  newList[idx] = entry
+  const writeMeta = await writeAgentsListToOpenClaw(newList)
+  if (patch.label != null && String(patch.label).trim() !== '') {
+    await tryOpenClawAgentSetIdentityName(slot, String(patch.label).trim())
+  }
+  return { configUpdated: true, needsGatewayRestart: true, ...writeMeta }
+}
+
+/**
+ * 在 OpenClaw 中登记 Agent：优先 CLI `agents add`，其次网关 agents.create（仅当明确 ok），否则 config set / 直写 openclaw.json。
+ * think 不进 agents.list（schema 限制），由 POST /api/agents 后续 sessions.patch 处理；描述在登记完成后写入 workspace 根目录 AGENTS.md，不进 agents.list。
+ */
+async function registerAgentInOpenClawConfig({ slot, label, model, modelProvider }) {
+  const fullModel = buildAgentConfigModelString(model, modelProvider)
+
+  const buildEntry = () => {
+    const entry = {
+      id: slot,
+      workspace: `~/.openclaw/workspace-${slot}`,
+      agentDir: `~/.openclaw/agents/${slot}/agent`,
+    }
+    if (label) {
+      entry.name = label
+      entry.identity = { name: label }
+    }
+    if (fullModel) entry.model = fullModel
+    return entry
+  }
+
+  const cli = await tryOpenClawAgentsAddCli({ slot, fullModel })
+  if (cli.registered) {
+    if (label && label !== slot) await tryOpenClawAgentSetIdentityName(slot, label)
+    return cli.skipped
+      ? { via: cli.via, skipped: true }
+      : { via: cli.via, ...(cli.cliResult != null ? { cliResult: cli.cliResult } : {}) }
+  }
+
+  try {
+    const gwPayload = { id: slot }
+    if (label) {
+      gwPayload.name = label
+      gwPayload.displayName = label
+    }
+    if (fullModel) gwPayload.model = fullModel
+    const mp = String(modelProvider ?? '').trim()
+    if (mp) gwPayload.modelProvider = mp
+    const gw = await runGatewayCall('agents.create', gwPayload, 20000)
+    const gwExplicitOk =
+      gw && typeof gw === 'object' && (gw.ok === true || gw.success === true)
+    if (gwExplicitOk) {
+      bridgeLog('api.agents.register_via_gateway', { slot })
+      return { via: 'gateway.agents.create', registerResult: gw }
+    }
+    bridgeLog('api.agents.register_gateway_not_ok', { slot, gw })
+  } catch (e) {
+    bridgeLog('api.agents.register_gateway_fallback', {
+      slot,
+      message: e instanceof Error ? e.message : String(e),
+    })
+  }
+
+  const list = await readAgentsListFromOpenClaw()
+  if (list.some((a) => String(a?.id) === slot)) {
+    bridgeLog('api.agents.register_config_skip_exists', { slot })
+    return { via: 'config.skip_exists', skipped: true }
+  }
+
+  const entry = buildEntry()
+  const newList = [...list, entry]
+
+  try {
+    await execFileAsync(
+      'openclaw',
+      ['config', 'set', 'agents.list', JSON.stringify(newList), '--strict-json'],
+      { env: process.env, maxBuffer: 10 * 1024 * 1024 },
+    )
+    bridgeLog('api.agents.register_via_config_set', { slot, count: newList.length })
+    return { via: 'openclaw.config.set', needsGatewayRestart: true }
+  } catch (e1) {
+    bridgeLog('api.agents.register_config_set_failed', {
+      slot,
+      message: e1 instanceof Error ? e1.message : String(e1),
+    })
+    try {
+      const cfgPath = getOpenClawConfigPath()
+      let cfg = {}
+      try {
+        cfg = JSON.parse(await fs.readFile(cfgPath, 'utf8'))
+      } catch {
+        cfg = {}
+      }
+      if (!cfg.agents || typeof cfg.agents !== 'object') cfg.agents = {}
+      const existing = stripUnsupportedAgentListKeys(Array.isArray(cfg.agents.list) ? [...cfg.agents.list] : [])
+      if (existing.some((a) => String(a?.id) === slot)) {
+        return { via: 'file.skip_exists', skipped: true }
+      }
+      cfg.agents.list = [...existing, entry]
+      await fs.mkdir(path.dirname(cfgPath), { recursive: true })
+      await fs.writeFile(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8')
+      bridgeLog('api.agents.register_via_file_write', { slot })
+      return { via: 'openclaw.json.direct', needsGatewayRestart: true }
+    } catch (e2) {
+      const msg = e2 instanceof Error ? e2.message : String(e2)
+      throw new Error(`register_agent_config_failed: ${msg}`)
+    }
+  }
+}
+
 function isLikelyUnsupportedGatewayMethodError(error) {
   const m = (error instanceof Error ? error.message : String(error)).toLowerCase()
   return (
@@ -1803,19 +2448,7 @@ app.post('/api/sessions/:sessionId/patch', async (req, res) => {
   try {
     const session = await resolveSession(req.params.sessionId)
     const { core, slashMessages } = splitPatchForGateway(built.patch)
-
-    let result
-    if (Object.keys(core).length > 0) {
-      result = await runGatewayCall('sessions.patch', gatewaySessionPatchParams(session.key, core))
-    }
-    for (const message of slashMessages) {
-      result = await runGatewayCall(
-        'chat.send',
-        { sessionKey: session.key, message, idempotencyKey: crypto.randomUUID() },
-        60000,
-      )
-      invalidateHistoryCacheForSessionKey(session.key)
-    }
+    const result = await applyGatewaySessionPreferencePatch(session.key, built.patch)
 
     invalidateSessionsListCache()
     res.json({

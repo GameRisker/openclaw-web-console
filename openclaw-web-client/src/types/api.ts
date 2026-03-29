@@ -34,6 +34,28 @@ export interface SessionsResponse {
   sessions: ApiSession[]
 }
 
+/** 与网关约定对齐 sessions：列表项字段尽量宽松以便兼容不同实现 */
+export interface ApiAgent {
+  agentId?: string
+  id?: string
+  key?: string
+  name?: string
+  label?: string
+  displayName?: string
+  description?: string
+  status?: string
+  state?: string
+  updatedAt?: number
+  createdAt?: number
+  model?: string
+  modelProvider?: string
+}
+
+export interface AgentsResponse {
+  count?: number
+  agents?: ApiAgent[]
+}
+
 export interface SessionHistoryResponse {
   sessionId: string
   sessionKey?: string
