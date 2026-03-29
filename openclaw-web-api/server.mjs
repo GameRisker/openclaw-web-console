@@ -92,6 +92,7 @@ function normalizeSession(item) {
     sessionId: item.sessionId,
     updatedAt: item.updatedAt,
     ageMs: item.ageMs,
+    createdAt: item.createdAt,
     model: item.model,
     modelProvider: item.modelProvider,
     totalTokens: item.totalTokens,

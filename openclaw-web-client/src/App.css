@@ -82,6 +82,170 @@ textarea {
   line-height: 1.2;
 }
 
+.rename-session-modal-root {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px))
+    max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.rename-session-modal-panel {
+  width: 100%;
+  max-width: min(420px, 100%);
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.96);
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  color: #e2e8f0;
+  animation: rename-session-modal-in 0.18s ease-out;
+}
+
+@keyframes rename-session-modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.rename-session-modal-form {
+  padding: 22px 24px 20px;
+  display: grid;
+  gap: 16px;
+}
+
+.rename-session-modal-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.rename-session-modal-label {
+  display: grid;
+  gap: 8px;
+}
+
+.rename-session-modal-field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.rename-session-modal-input {
+  width: 100%;
+  padding: 11px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(30, 41, 59, 0.75);
+  color: #e2e8f0;
+  font-size: 14px;
+}
+
+.rename-session-modal-input:focus {
+  outline: none;
+  border-color: rgba(96, 165, 250, 0.55);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.2);
+}
+
+.rename-session-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.delete-session-modal-body {
+  padding: 22px 24px 20px;
+  display: grid;
+  gap: 0;
+}
+
+.delete-session-modal-desc {
+  margin: 0 0 10px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #cbd5e1;
+}
+
+.delete-session-modal-desc strong {
+  color: #e2e8f0;
+  font-weight: 600;
+}
+
+.delete-session-modal-hint {
+  margin: 0 0 14px;
+  font-size: 12px;
+  color: #f87171;
+}
+
+.delete-session-modal-status {
+  margin: 0 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #7dd3fc;
+}
+
+.delete-session-modal-actions .danger-button {
+  padding: 10px 16px;
+  font-size: 13px;
+}
+
+.delete-session-modal-actions .secondary-button {
+  padding: 10px 16px;
+  font-size: 13px;
+}
+
+.app-toast {
+  position: fixed;
+  top: max(96px, calc(env(safe-area-inset-top, 0px) + 80px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 450;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 11px 20px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.45);
+  pointer-events: none;
+  animation: app-toast-in 0.2s ease-out;
+}
+
+@keyframes app-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+.app-toast--success {
+  background: rgba(22, 101, 52, 0.92);
+  border: 1px solid rgba(74, 222, 128, 0.35);
+  color: #bbf7d0;
+}
+
+.app-toast--error {
+  background: rgba(127, 29, 29, 0.92);
+  border: 1px solid rgba(252, 165, 165, 0.35);
+  color: #fecaca;
+}
+
 .login-subtitle,
 .panel-header p,
 .session-card p,
@@ -478,10 +642,38 @@ textarea {
 }
 
 .session-card-actions {
-  display: grid;
-  align-content: center;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 6px;
   flex: 0 0 auto;
+}
+
+.session-card-delete-btn {
+  padding: 2px 8px;
+  min-width: 28px;
+  min-height: 28px;
+  line-height: 1;
+  font-size: 18px;
+  font-weight: 300;
+  color: #94a3b8;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.session-card-delete-btn:hover {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.session-card-delete-btn:focus-visible {
+  outline: 2px solid rgba(248, 113, 113, 0.5);
+  outline-offset: 2px;
 }
 
 .icon-button.small {
@@ -582,6 +774,7 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: text;
 }
 
 .message-list {
@@ -594,7 +787,8 @@ textarea {
   align-content: start;
   align-items: start;
   overscroll-behavior: contain;
-  scroll-behavior: smooth;
+  /* 默认瞬时滚动：首次进会话滚到底时避免「从头刷到尾」；「回到底部」按钮仍用 JS scrollTo(smooth) */
+  scroll-behavior: auto;
 }
 
 /* prepend 历史后程序设置 scrollTop 时临时关闭 smooth，避免列表上下抖 */
@@ -1506,5 +1700,13 @@ textarea {
 @media (prefers-reduced-motion: reduce) {
   .message-list {
     scroll-behavior: auto;
+  }
+
+  .rename-session-modal-panel {
+    animation: none;
+  }
+
+  .app-toast {
+    animation: none;
   }
 }

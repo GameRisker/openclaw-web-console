@@ -36,6 +36,8 @@ export interface SessionItem {
   summary: string
   subtitle?: string
   state: SessionState
+  /** 列表排序用：优先网关 createdAt，否则由客户端推断并在刷新时保留 */
+  createdAt?: number
   updatedAt?: number
   ageMs?: number
   model?: string

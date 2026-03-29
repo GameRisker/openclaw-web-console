@@ -3,6 +3,8 @@ export interface ApiSession {
   sessionId: string
   updatedAt: number
   ageMs: number
+  /** 网关若提供则优先用于列表按创建时间排序 */
+  createdAt?: number
   model?: string
   modelProvider?: string
   totalTokens?: number

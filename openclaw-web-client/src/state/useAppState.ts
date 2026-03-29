@@ -12,8 +12,8 @@ import {
 import { mockSideCards, mockSessions } from './mockData'
 import { connectRealtime } from './realtime'
 import { openclawWebLog } from './debugLog'
-import type { RealtimeEvent, ApiMessage, TimelineRenderItem, TimelineEventItem } from '../types/api'
-import type { AppState, SessionItem } from '../types/app'
+import type { RealtimeEvent, ApiMessage, ApiSession, TimelineRenderItem, TimelineEventItem } from '../types/api'
+import type { AppState, HistoryStatus, SessionItem } from '../types/app'
 import { isUserFacingRole, timelineItemLooksLikeUserMessage } from '../utils/roles'
 import { HISTORY_FETCH_MAX, HISTORY_OLDER_STEP, HISTORY_PAGE_SIZE } from '../constants/history'
 
@@ -47,26 +47,40 @@ function mapSessionState(raw: string): SessionItem['state'] {
   return 'idle'
 }
 
-function sortSessionsByRecent(a: SessionItem, b: SessionItem) {
-  const updatedDiff = (b.updatedAt ?? 0) - (a.updatedAt ?? 0)
-  if (updatedDiff !== 0) return updatedDiff
-  const ageDiff = (a.ageMs ?? Number.MAX_SAFE_INTEGER) - (b.ageMs ?? Number.MAX_SAFE_INTEGER)
-  if (ageDiff !== 0) return ageDiff
-  return a.summary.localeCompare(b.summary)
+/** 按创建时间新→旧；选中会话只改 state，不再重排 */
+function sortSessionsByCreatedDesc(a: SessionItem, b: SessionItem) {
+  const ca = a.createdAt ?? a.updatedAt ?? 0
+  const cb = b.createdAt ?? b.updatedAt ?? 0
+  if (cb !== ca) return cb - ca
+  return String(a.id).localeCompare(String(b.id))
+}
+
+function deriveCreatedAtForSession(session: ApiSession, prev?: SessionItem): number {
+  const fromApi = session.createdAt
+  if (typeof fromApi === 'number' && fromApi > 0) return fromApi
+  const updatedAt =
+    typeof session.updatedAt === 'number' ? session.updatedAt : toTimestampMs(String(session.updatedAt ?? ''))
+  const ageMs = session.ageMs
+  if (typeof ageMs === 'number' && ageMs >= 0 && updatedAt > 0) {
+    const guessed = updatedAt - ageMs
+    if (guessed > 0) return guessed
+  }
+  if (prev?.createdAt && prev.createdAt > 0) return prev.createdAt
+  if (updatedAt > 0) return updatedAt
+  return Date.now()
 }
 
 function touchSessionState(
   sessions: SessionItem[],
   sessionId: string,
-  state: SessionItem['state'],
+  nextState: SessionItem['state'],
 ): SessionItem[] {
-  return sessions
-    .map((session): SessionItem => {
-      if (session.id === sessionId) return { ...session, state, updatedAt: Date.now() }
-      if (state === 'active' && session.state === 'active') return { ...session, state: 'idle' as SessionItem['state'] }
-      return session
-    })
-    .sort(sortSessionsByRecent)
+  return sessions.map((session): SessionItem => {
+    if (session.id === sessionId) return { ...session, state: nextState }
+    if (nextState === 'active' && session.state === 'active')
+      return { ...session, state: 'idle' as SessionItem['state'] }
+    return session
+  })
 }
 
 function toTimestampMs(value?: string) {
@@ -407,6 +421,22 @@ function getDisplayMessagesSnapshot(renderItems: TimelineRenderItem[], messages:
   return renderItems.length > 0 ? timelineRenderItemsToApiMessages(renderItems) : messages
 }
 
+type SessionHistoryCacheEntry = {
+  messages: ApiMessage[]
+  renderItems: TimelineRenderItem[]
+  historyHasMore: boolean
+  historyLoadingOlder: boolean
+  historyStatus: HistoryStatus
+}
+
+function cloneMessagesForCache(messages: ApiMessage[]): ApiMessage[] {
+  return messages.map((m) => ({ ...m }))
+}
+
+function cloneRenderItemsForCache(items: TimelineRenderItem[]): TimelineRenderItem[] {
+  return items.map((r) => ({ ...r }))
+}
+
 export function useAppState() {
   const [state, setState] = useState<AppState>(initialState)
   const [sessions, setSessions] = useState<SessionItem[]>(mockSessions)
@@ -423,6 +453,8 @@ export function useAppState() {
   const prevHistorySessionIdRef = useRef<string | null>(null)
   const historyHasMoreRef = useRef(false)
   const historyLoadingOlderRef = useRef(false)
+  /** 切换会话时写入、再进入时读出，避免每次 replace 全量拉历史 */
+  const sessionHistoryCacheRef = useRef<Map<string, SessionHistoryCacheEntry>>(new Map())
   const queuedFallbackTimerRef = useRef<number | null>(null)
   const sendAbortControllerRef = useRef<AbortController | null>(null)
   const autoTitledSessionIdsRef = useRef<Set<string>>(new Set())
@@ -438,6 +470,7 @@ export function useAppState() {
   messagesRef.current = messages
   renderItemsRef.current = renderItems
   historyHasMoreRef.current = state.historyHasMore
+  historyLoadingOlderRef.current = state.historyLoadingOlder
 
   useEffect(() => {
     if (state.sendStatus === 'queued') return
@@ -458,26 +491,35 @@ export function useAppState() {
 
   async function refreshSessions(preferredSessionId?: string) {
     const sessionsResult = await fetchSessions()
+    const prevById = new Map(sessionsRef.current.map((s) => [s.id, s]))
     const mappedSessions = sessionsResult.sessions
-      .map((session) => ({
-        id: session.sessionId,
-        key: session.key,
-        summary:
-          session.label?.trim() ||
-          session.displayName?.trim() ||
-          `${session.modelProvider ?? 'provider'} / ${session.model ?? 'model'}`,
-        subtitle:
-          [session.modelProvider, session.model].filter(Boolean).join('/') || session.displayName?.trim() || session.key,
-        state: mapSessionState('idle'),
-        updatedAt: typeof session.updatedAt === 'number' ? session.updatedAt : toTimestampMs(String(session.updatedAt ?? '')),
-        ageMs: session.ageMs,
-        model: session.model,
-        modelProvider: session.modelProvider,
-        totalTokens: session.totalTokens,
-        contextTokens: session.contextTokens,
-        kind: session.kind,
-      }))
-      .sort(sortSessionsByRecent)
+      .map((session) => {
+        const id = session.sessionId
+        const updatedAt =
+          typeof session.updatedAt === 'number' ? session.updatedAt : toTimestampMs(String(session.updatedAt ?? ''))
+        return {
+          id,
+          key: session.key,
+          summary:
+            session.label?.trim() ||
+            session.displayName?.trim() ||
+            `${session.modelProvider ?? 'provider'} / ${session.model ?? 'model'}`,
+          subtitle:
+            [session.modelProvider, session.model].filter(Boolean).join('/') ||
+            session.displayName?.trim() ||
+            session.key,
+          state: mapSessionState('idle'),
+          createdAt: deriveCreatedAtForSession(session, prevById.get(id)),
+          updatedAt,
+          ageMs: session.ageMs,
+          model: session.model,
+          modelProvider: session.modelProvider,
+          totalTokens: session.totalTokens,
+          contextTokens: session.contextTokens,
+          kind: session.kind,
+        }
+      })
+      .sort(sortSessionsByCreatedDesc)
 
     const nextActiveId =
       preferredSessionId && mappedSessions.some((session) => session.id === preferredSessionId)
@@ -994,21 +1036,49 @@ export function useAppState() {
 
     realtimeRef.current?.subscribe(state.activeSessionId)
 
-    const idChanged = prevHistorySessionIdRef.current !== state.activeSessionId
-    prevHistorySessionIdRef.current = state.activeSessionId
+    const prevId = prevHistorySessionIdRef.current
+    const nextId = state.activeSessionId
+    const idChanged = prevId !== nextId
 
-    if (idChanged) {
-      setMessages([])
-      setRenderItems([])
-      setState((prev) => ({
-        ...prev,
-        historyStatus: 'loading-history',
-        historyHasMore: false,
-        historyLoadingOlder: false,
-      }))
+    if (idChanged && prevId != null) {
+      sessionHistoryCacheRef.current.set(prevId, {
+        messages: cloneMessagesForCache(messagesRef.current),
+        renderItems: cloneRenderItemsForCache(renderItemsRef.current),
+        historyHasMore: historyHasMoreRef.current,
+        historyLoadingOlder: historyLoadingOlderRef.current,
+        historyStatus: state.historyStatus,
+      })
     }
 
-    scheduleHistoryRefresh(state.activeSessionId, 250, idChanged ? 'replace' : 'merge-tail')
+    let restoredFromCache = false
+    if (idChanged) {
+      const cached = sessionHistoryCacheRef.current.get(nextId)
+      if (cached) {
+        restoredFromCache = true
+        setMessages(cloneMessagesForCache(cached.messages))
+        setRenderItems(cloneRenderItemsForCache(cached.renderItems))
+        setState((prev) => ({
+          ...prev,
+          historyStatus: cached.historyStatus === 'error' ? 'loading-history' : cached.historyStatus,
+          historyHasMore: cached.historyHasMore,
+          historyLoadingOlder: cached.historyLoadingOlder,
+        }))
+      } else {
+        setMessages([])
+        setRenderItems([])
+        setState((prev) => ({
+          ...prev,
+          historyStatus: 'loading-history',
+          historyHasMore: false,
+          historyLoadingOlder: false,
+        }))
+      }
+    }
+
+    prevHistorySessionIdRef.current = nextId
+
+    const refreshMode: 'replace' | 'merge-tail' = idChanged ? (restoredFromCache ? 'merge-tail' : 'replace') : 'merge-tail'
+    scheduleHistoryRefresh(nextId, 250, refreshMode)
 
     return () => {
       if (refreshHistoryTimerRef.current != null) {
@@ -1279,16 +1349,16 @@ export function useAppState() {
     }
   }
 
-  async function renameSessionTitle(sessionId: string) {
-    const current = sessions.find((item) => item.id === sessionId)
-    const nextLabel = window.prompt('Rename session', current?.summary || '')?.trim()
-    if (!nextLabel) return
+  /** 由 UI（dialog 等）提交新标题；不再使用 window.prompt（内嵌浏览器常不可用） */
+  async function commitRenameSession(sessionId: string, nextLabel: string) {
+    const t = nextLabel.trim()
+    if (!t) return
 
     try {
       manuallyTitledSessionIdsRef.current.add(sessionId)
       autoTitledSessionIdsRef.current.add(sessionId)
-      await renameSession(sessionId, nextLabel)
-      setSessions((prev) => prev.map((item) => (item.id === sessionId ? { ...item, summary: nextLabel } : item)))
+      await renameSession(sessionId, t)
+      setSessions((prev) => prev.map((item) => (item.id === sessionId ? { ...item, summary: t } : item)))
       setState((prev) => ({
         ...prev,
         runtimeNote: 'session renamed',
@@ -1304,10 +1374,8 @@ export function useAppState() {
     }
   }
 
-  async function removeSession(sessionId: string) {
-    const confirmed = window.confirm(`Delete session ${sessionId}?`)
-    if (!confirmed) return
-
+  /** 执行删除（无 UI 确认）；成功返回 true */
+  async function removeSession(sessionId: string): Promise<boolean> {
     try {
       const currentIndex = sessions.findIndex((session) => session.id === sessionId)
       const fallbackId =
@@ -1316,18 +1384,21 @@ export function useAppState() {
           : state.activeSessionId
 
       await deleteSession(sessionId)
+      sessionHistoryCacheRef.current.delete(sessionId)
       await refreshSessions(fallbackId)
       setState((prev) => ({
         ...prev,
         runtimeNote: 'session deleted',
         composerError: undefined,
       }))
+      return true
     } catch (error) {
       setState((prev) => ({
         ...prev,
         composerError: error instanceof Error ? error.message : 'delete_session_failed',
         runtimeNote: 'delete session failed',
       }))
+      return false
     }
   }
 
@@ -1390,7 +1461,7 @@ export function useAppState() {
     refreshHistory: () => void refreshHistory(state.activeSessionId, 'replace'),
     loadOlderHistory,
     createNewSession,
-    renameSessionTitle,
+    commitRenameSession,
     removeSession,
   }
 }

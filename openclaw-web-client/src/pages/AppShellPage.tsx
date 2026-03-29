@@ -12,6 +12,7 @@ import {
 } from '../lib/slashCommands'
 import { isUserFacingRole } from '../utils/roles'
 import type { ApiMessage } from '../types/api'
+import { DeleteSessionConfirmModal, RenameSessionDialog, SessionListPanel } from '../features/session-list'
 
 function getConnectionPillClass(status: string) {
   if (status === 'connected') return 'success'
@@ -302,18 +303,6 @@ function formatTokenCount(value?: number) {
   return `${kb.toFixed(2)}KB`
 }
 
-function formatRelativeTime(timestamp?: number) {
-  if (!timestamp) return 'recently'
-  const diff = Math.max(0, Date.now() - timestamp)
-  if (diff < 60_000) return 'just now'
-  const minutes = Math.floor(diff / 60_000)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
-
 function toMessageTimeMs(ts?: string): number {
   if (!ts) return 0
   const numeric = Number(ts)
@@ -377,7 +366,8 @@ export function AppShellPage() {
     refreshHistory,
     loadOlderHistory,
     createNewSession,
-    renameSessionTitle,
+    commitRenameSession,
+    removeSession,
     modelSideStreaming,
   } = useAppState()
 
@@ -385,12 +375,23 @@ export function AppShellPage() {
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
   const shouldStickToBottomRef = useRef(true)
   const previousSessionIdRef = useRef(activeSession.id)
+  const historyStatusRef = useRef(state.historyStatus)
+  historyStatusRef.current = state.historyStatus
   const [showJumpToBottom, setShowJumpToBottom] = useState(false)
   const [composerCursor, setComposerCursor] = useState(0)
   const [slashMenuSuppressed, setSlashMenuSuppressed] = useState(false)
   const [slashHighlightIndex, setSlashHighlightIndex] = useState(0)
   /** 非 null 时表示正在选该顶层命令的子项（与 TUI 二级菜单类似） */
   const [slashParentForSubmenu, setSlashParentForSubmenu] = useState<SlashCommand | null>(null)
+  const [sessionRename, setSessionRename] = useState<{ id: string; initial: string } | null>(null)
+  const [sessionDeleteConfirm, setSessionDeleteConfirm] = useState<{ id: string; summary: string } | null>(null)
+  const [appToast, setAppToast] = useState<{ text: string; kind: 'success' | 'error' } | null>(null)
+
+  useEffect(() => {
+    if (!appToast) return
+    const t = window.setTimeout(() => setAppToast(null), 3200)
+    return () => window.clearTimeout(t)
+  }, [appToast])
 
   const runtimeBadge = getRuntimeBadge(state.toolActivityStatus)
   const sendButton = getSendButtonMeta(state.sendStatus)
@@ -522,48 +523,30 @@ export function AppShellPage() {
     )
   }, [slashListItems.length])
 
+  /** 切换会话：贴底、收起「回到底部」；具体滚到底由下方 useLayoutEffect 在绘制前完成 */
   useEffect(() => {
-    const node = messageListRef.current
-    if (!node) return
-
-    const forceScrollToBottom = () => {
-      requestAnimationFrame(() => {
-        const nextNode = messageListRef.current
-        if (!nextNode) return
-        nextNode.scrollTop = nextNode.scrollHeight
-        requestAnimationFrame(() => {
-          const finalNode = messageListRef.current
-          if (!finalNode) return
-          finalNode.scrollTop = finalNode.scrollHeight
-        })
-      })
-    }
-
     if (previousSessionIdRef.current !== activeSession.id) {
       previousSessionIdRef.current = activeSession.id
       shouldStickToBottomRef.current = true
       setShowJumpToBottom(false)
-      forceScrollToBottom()
-      return
     }
+  }, [activeSession.id])
 
-    if (state.historyStatus === 'ready' && shouldStickToBottomRef.current) {
-      forceScrollToBottom()
-      return
-    }
-
-    if (!shouldStickToBottomRef.current) return
-
-    forceScrollToBottom()
-  }, [activeSession.id, messages, state.historyStatus])
-
-  /** 同帧内先出 Assistant 再插入 Verbose 时，仅靠 useEffect 可能早于子节点高度提交；layout 后再滚到底 */
+  /**
+   * 绘制前把列表滚到底（加 instant-scroll 类避免残留 smooth），避免首进会话时先看到顶部再被 effect 拽下去。
+   */
   useLayoutEffect(() => {
     const node = messageListRef.current
     if (!node || !shouldStickToBottomRef.current) return
-    if (previousSessionIdRef.current !== activeSession.id) return
+    node.classList.add('message-list--instant-scroll')
     node.scrollTop = node.scrollHeight
-  }, [messages, activeSession.id])
+    requestAnimationFrame(() => {
+      const n = messageListRef.current
+      if (!n || !shouldStickToBottomRef.current) return
+      n.scrollTop = n.scrollHeight
+      n.classList.remove('message-list--instant-scroll')
+    })
+  }, [messages, activeSession.id, state.historyStatus])
 
   useEffect(() => {
     const el = messageListRef.current
@@ -571,9 +554,12 @@ export function AppShellPage() {
     let raf = 0
     const scrollIfSticking = () => {
       if (!shouldStickToBottomRef.current) return
+      if (historyStatusRef.current === 'loading-history') return
       const node = messageListRef.current
       if (!node) return
+      node.classList.add('message-list--instant-scroll')
       node.scrollTop = node.scrollHeight
+      requestAnimationFrame(() => node.classList.remove('message-list--instant-scroll'))
     }
     const mo = new MutationObserver(() => {
       cancelAnimationFrame(raf)
@@ -790,6 +776,29 @@ export function AppShellPage() {
 
   return (
     <main className="console-page">
+      <RenameSessionDialog
+        open={sessionRename != null}
+        sessionId={sessionRename?.id ?? null}
+        initialLabel={sessionRename?.initial ?? ''}
+        onDismiss={() => setSessionRename(null)}
+        onCommit={async (sessionId, label) => {
+          await commitRenameSession(sessionId, label)
+        }}
+      />
+      <DeleteSessionConfirmModal
+        open={sessionDeleteConfirm != null}
+        sessionId={sessionDeleteConfirm?.id ?? ''}
+        sessionSummary={sessionDeleteConfirm?.summary ?? ''}
+        onDismiss={() => setSessionDeleteConfirm(null)}
+        performDelete={removeSession}
+        onDeleted={() => setAppToast({ text: '会话已删除', kind: 'success' })}
+        onDeleteFailed={() => setAppToast({ text: '删除失败，请查看上方错误信息或稍后重试', kind: 'error' })}
+      />
+      {appToast && (
+        <div className={`app-toast app-toast--${appToast.kind}`} role="status" aria-live="polite">
+          {appToast.text}
+        </div>
+      )}
       <header className="topbar">
         <div>
           <div className="eyebrow">OpenClaw Console</div>
@@ -818,60 +827,24 @@ export function AppShellPage() {
         className={`console-grid ${state.isLeftSidebarCollapsed ? 'left-collapsed' : ''} ${state.isRightSidebarCollapsed ? 'right-collapsed' : ''}`}
       >
         {!state.isLeftSidebarCollapsed && (
-          <aside className="panel sidebar-panel">
-            <div className="panel-header compact-sidebar-header">
-              <div className="sidebar-panel-title">
-                <h2>Sessions</h2>
-              </div>
-              <div className="panel-header-actions sidebar-panel-toolbar">
-                <button type="button" className="icon-button sidebar-icon-btn" onClick={toggleLeftSidebar} title="收起列表">
-                  ◀
-                </button>
-                <button type="button" className="icon-button sidebar-icon-btn" onClick={refreshHistory} title="刷新历史">
-                  ↻
-                </button>
-                <button
-                  type="button"
-                  className="icon-button sidebar-icon-btn"
-                  title="新建会话"
-                  onClick={async () => {
-                    const nextName = window.prompt('Session name')?.trim()
-                    if (!nextName) return
-                    await createNewSession(nextName)
-                  }}
-                >
-                  ＋
-                </button>
-              </div>
-            </div>
-
-            <div className="session-list compact-session-list">
-              {filteredSessions.map((session) => (
-                <article
-                  key={session.id}
-                  className={`session-card ${session.id === activeSession.id ? 'active' : ''}`}
-                  onClick={() => selectSession(session.id)}
-                >
-                  <div className="session-card-body">
-                    <h3
-                      className="session-title"
-                      onDoubleClick={(event) => {
-                        event.stopPropagation()
-                        void renameSessionTitle(session.id)
-                      }}
-                      title="Double click to rename"
-                    >
-                      {session.summary}
-                    </h3>
-                    <p className="session-subtitle">{`${session.subtitle || 'session'} · ${formatRelativeTime(session.updatedAt)}`}</p>
-                  </div>
-                  <div className="session-card-actions">
-                    <span className={`mini-state ${session.state}`}>{session.state}</span>
-                  </div>
-                </article>
-              ))}
-            </div>
-          </aside>
+          <SessionListPanel
+            sessions={filteredSessions}
+            activeSessionId={activeSession.id}
+            onSelectSession={selectSession}
+            onCollapseSidebar={toggleLeftSidebar}
+            onRefreshSessions={refreshHistory}
+            onRequestCreateSession={async () => {
+              const nextName = window.prompt('Session name')?.trim()
+              if (!nextName) return
+              await createNewSession(nextName)
+            }}
+            onBeginRenameSession={(sessionId, currentTitle) =>
+              setSessionRename({ id: sessionId, initial: currentTitle })
+            }
+            onRequestDeleteSession={(sessionId, summary) =>
+              setSessionDeleteConfirm({ id: sessionId, summary })
+            }
+          />
         )}
 
         <section
@@ -893,7 +866,20 @@ export function AppShellPage() {
 
           <div className="panel-header chat-header">
             <div className="chat-title-wrap">
-              <h2>{activeSession.summary}</h2>
+              <h2
+                title="双击重命名"
+                onMouseDown={(event) => {
+                  if (event.button !== 0) return
+                  if (event.detail !== 2) return
+                  event.preventDefault()
+                  setSessionRename({ id: activeSession.id, initial: activeSession.summary })
+                }}
+                onDoubleClick={(event) => {
+                  event.preventDefault()
+                }}
+              >
+                {activeSession.summary}
+              </h2>
               <span className={`mini-state ${activeSession.state === 'error' ? 'error' : activeSession.state === 'busy' ? 'busy' : activeSession.state === 'active' ? 'active' : 'idle'}`}>
                 {activeSession.state}
               </span>

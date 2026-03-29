@@ -1,9 +1,11 @@
 import type { SessionItem, SideCard } from '../types/app'
 
+const mockT0 = 1_700_000_000_000
+
 export const mockSessions: SessionItem[] = [
-  { id: 'main', summary: '当前主会话', state: 'active' },
-  { id: 'project-ui', summary: 'Web UI 方案讨论', state: 'idle' },
-  { id: 'config-review', summary: '配置管理设计', state: 'idle' },
+  { id: 'main', summary: '当前主会话', state: 'active', createdAt: mockT0, updatedAt: mockT0 + 60_000 },
+  { id: 'project-ui', summary: 'Web UI 方案讨论', state: 'idle', createdAt: mockT0 + 3_600_000, updatedAt: mockT0 + 3_600_000 },
+  { id: 'config-review', summary: '配置管理设计', state: 'idle', createdAt: mockT0 + 7_200_000, updatedAt: mockT0 + 7_200_000 },
 ]
 
 export const mockSideCards: SideCard[] = [
