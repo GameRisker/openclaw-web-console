@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
@@ -20,17 +20,10 @@ function getRuntimeBadge(status: string) {
 }
 
 function getSendButtonMeta(sendStatus: string) {
-  if (sendStatus === 'waiting-response') return { label: 'Stop', className: 'danger-button' }
-  if (sendStatus === 'sending') return { label: 'Sending…', className: 'primary-button' }
-  if (sendStatus === 'queued') return { label: 'Queued…', className: 'primary-button' }
+  if (sendStatus === 'sending' || sendStatus === 'queued' || sendStatus === 'waiting-response') {
+    return { label: 'Stop', className: 'danger-button' }
+  }
   return { label: 'Send', className: 'primary-button' }
-}
-
-function getRunStatusClass(status?: string) {
-  if (status === 'completed') return 'success'
-  if (status === 'failed') return 'danger'
-  if (status === 'stopped') return 'dark'
-  return 'info'
 }
 
 function formatDuration(ms?: number) {
@@ -104,6 +97,7 @@ export function AppShellPage() {
     refreshHistory,
     createNewSession,
     renameSessionTitle,
+    modelSideStreaming,
   } = useAppState()
 
   const messageListRef = useRef<HTMLDivElement | null>(null)
@@ -116,9 +110,17 @@ export function AppShellPage() {
   const [waitElapsedMs, setWaitElapsedMs] = useState(0)
   const contextTokenLabel = formatTokenCount(activeSession.contextTokens)
   const totalTokenLabel = formatTokenCount(activeSession.totalTokens)
+  const ctxN = activeSession.contextTokens
+  const totN = activeSession.totalTokens
+  /** 网关的 contextTokens/totalTokens 未必是「已用/上限」；仅当分母 ≥ 分子时百分比才有意义 */
   const tokenLine =
     contextTokenLabel && totalTokenLabel
-      ? `tokens ${contextTokenLabel}/${totalTokenLabel} (${Math.round(((activeSession.contextTokens ?? 0) / Math.max(activeSession.totalTokens ?? 1, 1)) * 100)}%)`
+      ? typeof ctxN === 'number' &&
+          typeof totN === 'number' &&
+          totN > 0 &&
+          ctxN <= totN
+        ? `tokens ${contextTokenLabel}/${totalTokenLabel} (${Math.round((ctxN / totN) * 100)}%)`
+        : `tokens ctx ${contextTokenLabel} · ${totalTokenLabel}`
       : totalTokenLabel
         ? `tokens ${totalTokenLabel}`
         : undefined
@@ -133,9 +135,7 @@ export function AppShellPage() {
           : 'idle'
 
   const sessionMeta = [
-    activeSession.state,
     activeSession.model ? `${activeSession.modelProvider ? `${activeSession.modelProvider}/` : ''}${activeSession.model}` : undefined,
-    `session ${activeSession.id}`,
     'agent main',
     'think low',
     'verbose on',
@@ -147,13 +147,34 @@ export function AppShellPage() {
 
   const visibleMessages = messages
 
+  const awaitingAssistantReply =
+    state.sendStatus === 'sending' ||
+    state.sendStatus === 'queued' ||
+    state.sendStatus === 'waiting-response' ||
+    (state.sendStatus === 'completed' && modelSideStreaming)
+
+  let lastUserMessageIndex = -1
+  visibleMessages.forEach((m, i) => {
+    if (isUserFacingRole(m.role, m.kind)) lastUserMessageIndex = i
+  })
+  const lastRunningIndex = visibleMessages.map((m) => m.runStatus).lastIndexOf('running')
+  const anyRunningInThread = lastRunningIndex >= 0
+
+  /** 与 waitElapsedMs 的 effect 一致：有进行中的轮次时在输入框状态栏显示计时 */
+  const runTimerVisible =
+    Boolean(state.currentRunStartedAt) &&
+    state.sendStatus !== 'idle' &&
+    state.sendStatus !== 'error' &&
+    state.sendStatus !== 'stopped' &&
+    !(state.sendStatus === 'completed' && !modelSideStreaming)
+
   useEffect(() => {
     const runFinished =
       !state.currentRunStartedAt ||
-      state.sendStatus === 'completed' ||
-      state.sendStatus === 'stopped' ||
+      state.sendStatus === 'idle' ||
       state.sendStatus === 'error' ||
-      state.sendStatus === 'idle'
+      state.sendStatus === 'stopped' ||
+      (state.sendStatus === 'completed' && !modelSideStreaming)
 
     if (runFinished) {
       setWaitElapsedMs(0)
@@ -167,7 +188,7 @@ export function AppShellPage() {
     tick()
     const timer = window.setInterval(tick, 200)
     return () => window.clearInterval(timer)
-  }, [state.currentRunStartedAt, state.sendStatus])
+  }, [state.currentRunStartedAt, state.sendStatus, modelSideStreaming])
   useEffect(() => {
     const node = messageListRef.current
     if (!node) return
@@ -203,12 +224,44 @@ export function AppShellPage() {
     forceScrollToBottom()
   }, [activeSession.id, messages, state.historyStatus])
 
+  /** 同帧内先出 Assistant 再插入 Verbose 时，仅靠 useEffect 可能早于子节点高度提交；layout 后再滚到底 */
+  useLayoutEffect(() => {
+    const node = messageListRef.current
+    if (!node || !shouldStickToBottomRef.current) return
+    if (previousSessionIdRef.current !== activeSession.id) return
+    node.scrollTop = node.scrollHeight
+  }, [messages, activeSession.id])
+
+  useEffect(() => {
+    const el = messageListRef.current
+    if (!el) return
+    let raf = 0
+    const scrollIfSticking = () => {
+      if (!shouldStickToBottomRef.current) return
+      const node = messageListRef.current
+      if (!node) return
+      node.scrollTop = node.scrollHeight
+    }
+    const mo = new MutationObserver(() => {
+      cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        scrollIfSticking()
+      })
+    })
+    mo.observe(el, { childList: true, subtree: true, characterData: true })
+    return () => {
+      cancelAnimationFrame(raf)
+      mo.disconnect()
+    }
+  }, [activeSession.id])
+
   function handleMessageListScroll() {
     const node = messageListRef.current
     if (!node) return
 
     const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight
-    const nearBottom = distanceFromBottom < 48
+    const nearBottom = distanceFromBottom < 96
     shouldStickToBottomRef.current = nearBottom
     setShowJumpToBottom(!nearBottom)
   }
@@ -225,7 +278,7 @@ export function AppShellPage() {
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault()
-      void sendCurrentMessage()
+      void sendCurrentMessage(false)
     }
   }
 
@@ -398,12 +451,19 @@ export function AppShellPage() {
                           : 'muted'
 
                 const isLatestRunningMessage =
-                  message.runStatus === 'running' &&
-                  index === visibleMessages.map((item) => item.runStatus).lastIndexOf('running')
+                  message.runStatus === 'running' && index === lastRunningIndex
+                /** queued 时尚无 running 气泡，用户消息已被标为 completed，计时挂最后一条用户消息上 */
+                const showWaitTimerOnUserTail =
+                  awaitingAssistantReply &&
+                  !anyRunningInThread &&
+                  isUser &&
+                  index === lastUserMessageIndex &&
+                  Boolean(state.currentRunStartedAt)
+                const showStreamingTimer = isLatestRunningMessage || showWaitTimerOnUserTail
 
                 return (
                   <article key={message.id} className={`message-row ${messageClass}`}>
-                    <div className={`message-card ${messageClass} ${isLatestRunningMessage ? 'streaming' : ''}`}>
+                    <div className={`message-card ${messageClass} ${showStreamingTimer ? 'streaming' : ''}`}>
                       <div className="message-card-header">
                         <div className="message-card-header-main">
                           <strong>
@@ -423,11 +483,6 @@ export function AppShellPage() {
                           </strong>
                           {headerLabel && <span className="message-header-label">{headerLabel}</span>}
                         </div>
-                        {message.runStatus && (
-                          <span className={`status-pill tiny ${getRunStatusClass(message.runStatus)}`}>
-                            {message.runStatus}
-                          </span>
-                        )}
                       </div>
                       <div
                         className="message-content markdown-content"
@@ -435,12 +490,6 @@ export function AppShellPage() {
                           __html: renderMarkdown(message.content || '（空内容）'),
                         }}
                       />
-                      {isLatestRunningMessage && (
-                        <div className="streaming-status">
-                          <span className="streaming-cursor">▍</span>
-                          <span className="streaming-timer">{formatElapsed(waitElapsedMs)}</span>
-                        </div>
-                      )}
                     </div>
                   </article>
                 )
@@ -461,6 +510,11 @@ export function AppShellPage() {
                 {state.composerError ? (
                   <>
                     <span className={`mini-state composer-state ${statusToneClass}`}>{state.sendStatus}</span>
+                    {runTimerVisible && (
+                      <span className="composer-elapsed" aria-live="polite">
+                        {formatElapsed(waitElapsedMs)}
+                      </span>
+                    )}
                     <span className="composer-error">
                       {sessionMeta}
                       {` | error ${state.composerError}`}
@@ -469,6 +523,11 @@ export function AppShellPage() {
                 ) : (
                   <>
                     <span className={`mini-state composer-state ${statusToneClass}`}>{state.sendStatus}</span>
+                    {runTimerVisible && (
+                      <span className="composer-elapsed" aria-live="polite">
+                        {formatElapsed(waitElapsedMs)}
+                      </span>
+                    )}
                     <span className="composer-hint">{sessionMeta}</span>
                   </>
                 )}
@@ -485,9 +544,9 @@ export function AppShellPage() {
                 onKeyDown={handleComposerKeyDown}
               />
               <button
+                type="button"
                 className={`${sendButton.className} composer-send-button`}
-                onClick={sendCurrentMessage}
-                disabled={state.sendStatus === 'sending'}
+                onClick={() => void sendCurrentMessage(true)}
               >
                 {sendButton.label}
               </button>

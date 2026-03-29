@@ -165,16 +165,21 @@ function reconcileSendStatusFromAssistantRenderItem(
   ) {
     return prev
   }
+  const done = ri.status === 'completed'
   return {
     ...prev,
     sendStatus: ri.status === 'failed' ? 'error' : ri.status === 'stopped' ? 'stopped' : 'completed',
     toolActivityStatus: ri.status === 'failed' ? 'failed' : ri.status === 'stopped' ? 'stopped' : 'completed',
     runtimeNote:
       ri.status === 'failed' ? 'run failed' : ri.status === 'stopped' ? 'stopped' : 'completed',
-    currentRunStartedAt: undefined,
-    lastRunDurationMs: prev.currentRunStartedAt
-      ? Math.max(0, Date.now() - prev.currentRunStartedAt)
-      : prev.lastRunDurationMs,
+    ...(done
+      ? {}
+      : {
+          currentRunStartedAt: undefined,
+          lastRunDurationMs: prev.currentRunStartedAt
+            ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+            : prev.lastRunDurationMs,
+        }),
   }
 }
 
@@ -310,6 +315,7 @@ export function useAppState() {
   const renderItemsRef = useRef<TimelineRenderItem[]>([])
   const refreshHistoryTimerRef = useRef<number | null>(null)
   const queuedFallbackTimerRef = useRef<number | null>(null)
+  const sendAbortControllerRef = useRef<AbortController | null>(null)
   const autoTitledSessionIdsRef = useRef<Set<string>>(new Set())
   const manuallyTitledSessionIdsRef = useRef<Set<string>>(new Set())
   const sessionsRef = useRef<SessionItem[]>(sessions)
@@ -402,7 +408,11 @@ export function useAppState() {
       setRenderItems((prev) =>
         mergeSnapshotRenderItems(toRenderItemsFromMessages(normalized, sessionId), prev, sessionId),
       )
-      setState((prev) => reconcileSendStatusAfterHistory({ ...prev, historyStatus: 'ready' }, normalized))
+      setState((prev) => {
+        const next = reconcileSendStatusAfterHistory({ ...prev, historyStatus: 'ready' }, normalized)
+        // HTTP 历史已成功：清掉此前 WS session.error 等留下的 composerError，避免与正常 meta 叠显
+        return { ...next, composerError: undefined }
+      })
     } catch {
       if (activeSessionIdRef.current !== sessionId) return
       setMessages([])
@@ -475,10 +485,6 @@ export function useAppState() {
                 sendStatus: 'completed',
                 toolActivityStatus: 'completed',
                 runtimeNote: 'completed',
-                currentRunStartedAt: undefined,
-                lastRunDurationMs: prev.currentRunStartedAt
-                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
-                  : prev.lastRunDurationMs,
               }
             }
             if (st === 'error') {
@@ -546,6 +552,10 @@ export function useAppState() {
                 sendStatus: 'error',
                 toolActivityStatus: 'failed',
                 runtimeNote: 'run failed',
+                currentRunStartedAt: undefined,
+                lastRunDurationMs: prev.currentRunStartedAt
+                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+                  : prev.lastRunDurationMs,
               }
             }
             if (
@@ -559,10 +569,6 @@ export function useAppState() {
                 sendStatus: 'completed',
                 toolActivityStatus: 'completed',
                 runtimeNote: 'completed',
-                currentRunStartedAt: undefined,
-                lastRunDurationMs: prev.currentRunStartedAt
-                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
-                  : prev.lastRunDurationMs,
               }
             }
             if (event.event.type === 'run.stopped') {
@@ -574,6 +580,9 @@ export function useAppState() {
                 toolActivityStatus: 'stopped',
                 runtimeNote: 'stopped',
                 currentRunStartedAt: undefined,
+                lastRunDurationMs: prev.currentRunStartedAt
+                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+                  : prev.lastRunDurationMs,
               }
             }
             if (event.event.type === 'run.started') {
@@ -614,6 +623,7 @@ export function useAppState() {
               isModel &&
               (prev.sendStatus === 'waiting-response' || prev.sendStatus === 'queued' || prev.sendStatus === 'sending')
             ) {
+              const isCompleted = msg.runStatus === 'completed'
               return {
                 ...prev,
                 historyStatus: 'ready',
@@ -623,10 +633,14 @@ export function useAppState() {
                   msg.runStatus === 'failed' ? 'failed' : msg.runStatus === 'stopped' ? 'stopped' : 'completed',
                 runtimeNote:
                   msg.runStatus === 'failed' ? 'run failed' : msg.runStatus === 'stopped' ? 'stopped' : 'completed',
-                currentRunStartedAt: undefined,
-                lastRunDurationMs: prev.currentRunStartedAt
-                  ? Math.max(0, Date.now() - prev.currentRunStartedAt)
-                  : prev.lastRunDurationMs,
+                ...(isCompleted
+                  ? {}
+                  : {
+                      currentRunStartedAt: undefined,
+                      lastRunDurationMs: prev.currentRunStartedAt
+                        ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+                        : prev.lastRunDurationMs,
+                    }),
               }
             }
             return {
@@ -653,6 +667,7 @@ export function useAppState() {
           setState((prev) => ({
             ...prev,
             historyStatus: 'ready',
+            ...(event.replace ? { composerError: undefined } : {}),
           }))
         }
 
@@ -771,15 +786,44 @@ export function useAppState() {
     [renderItems, messages],
   )
 
-  async function sendCurrentMessage() {
-    if (state.sendStatus === 'sending') return
+  const modelSideStreaming = useMemo(
+    () =>
+      displayMessages.some(
+        (m) =>
+          !isUserFacingRole(m.role, m.kind) &&
+          m.kind !== 'user' &&
+          m.role !== 'user' &&
+          m.runStatus === 'running',
+      ),
+    [displayMessages],
+  )
+
+  /** 网关先报 completed 时气泡可能仍为 running；等无 running 后再清计时起点并写入 lastRunDurationMs */
+  useEffect(() => {
+    if (state.sendStatus !== 'completed') return
+    if (modelSideStreaming) return
+    setState((prev) => {
+      if (prev.sendStatus !== 'completed') return prev
+      if (prev.currentRunStartedAt == null) return prev
+      return {
+        ...prev,
+        currentRunStartedAt: undefined,
+        lastRunDurationMs: Math.max(0, Date.now() - prev.currentRunStartedAt),
+      }
+    })
+  }, [modelSideStreaming, state.sendStatus])
+
+  async function sendCurrentMessage(allowAbortWhileSending = false) {
+    if (state.sendStatus === 'sending') {
+      if (allowAbortWhileSending) sendAbortControllerRef.current?.abort()
+      return
+    }
 
     const draft = currentDraft.trim()
 
-    if (state.sendStatus === 'waiting-response') {
+    if (state.sendStatus === 'waiting-response' || state.sendStatus === 'queued') {
       await stopCurrentRun()
       if (!draft) return
-      // 有草稿：先停当前轮再发下一条；无草稿：仅停止（修复空输入时点「Stop」被 !draft 挡掉的问题）
     } else if (!draft) {
       return
     }
@@ -824,8 +868,10 @@ export function useAppState() {
       },
     }))
 
+    const ac = new AbortController()
+    sendAbortControllerRef.current = ac
     try {
-      await sendSessionMessage(sessionId, draft)
+      await sendSessionMessage(sessionId, draft, { signal: ac.signal })
       setRenderItems((prev) =>
         prev.map((item) =>
           item.id === optimisticMessageId ? { ...item, status: 'completed' } : item,
@@ -862,6 +908,38 @@ export function useAppState() {
         void refreshHistory(sessionId)
       }, 3500)
     } catch (error) {
+      const aborted =
+        (error instanceof Error && error.name === 'AbortError') ||
+        (typeof DOMException !== 'undefined' && error instanceof DOMException && error.name === 'AbortError')
+      if (aborted) {
+        setRenderItems((prev) =>
+          prev.map((item) =>
+            item.id === optimisticMessageId ? { ...item, status: 'failed' as const } : item,
+          ),
+        )
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === optimisticMessageId ? { ...message, runStatus: 'failed' as const } : message,
+          ),
+        )
+        setState((prev) => ({
+          ...prev,
+          sendStatus: 'idle',
+          toolActivityStatus: 'idle',
+          composerError: undefined,
+          runtimeNote: 'send cancelled',
+          currentRunStartedAt: undefined,
+          lastRunDurationMs: prev.currentRunStartedAt
+            ? Math.max(0, Date.now() - prev.currentRunStartedAt)
+            : prev.lastRunDurationMs,
+          draftBySession: {
+            ...prev.draftBySession,
+            [sessionId]: draft,
+          },
+        }))
+        setSessions((current) => touchSessionState(current, sessionId, 'active'))
+        return
+      }
       setRenderItems((prev) =>
         prev.map((item) =>
           item.id === optimisticMessageId ? { ...item, status: 'failed' } : item,
@@ -885,6 +963,8 @@ export function useAppState() {
           [sessionId]: draft,
         },
       }))
+    } finally {
+      sendAbortControllerRef.current = null
     }
   }
 
@@ -999,6 +1079,7 @@ export function useAppState() {
     activeSession,
     currentDraft,
     messages: displayMessages,
+    modelSideStreaming,
     sideCards: [
       mockSideCards[0],
       { ...mockSideCards[1], items: statusSummary },
@@ -1037,6 +1118,10 @@ export function useAppState() {
           prev.sendStatus === 'error' || prev.sendStatus === 'completed' || prev.sendStatus === 'stopped'
             ? 'editing'
             : prev.runtimeNote,
+        currentRunStartedAt:
+          prev.sendStatus === 'error' || prev.sendStatus === 'completed' || prev.sendStatus === 'stopped'
+            ? undefined
+            : prev.currentRunStartedAt,
         draftBySession: {
           ...prev.draftBySession,
           [prev.activeSessionId]: value,

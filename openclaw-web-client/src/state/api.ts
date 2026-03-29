@@ -33,7 +33,11 @@ export async function fetchStatus() {
   return response.json()
 }
 
-export async function sendSessionMessage(sessionId: string, message: string) {
+export async function sendSessionMessage(
+  sessionId: string,
+  message: string,
+  options?: { signal?: AbortSignal },
+) {
   openclawWebLog('http send request', {
     sessionId,
     messagePreview: message.slice(0, 120) + (message.length > 120 ? '…' : ''),
@@ -44,6 +48,7 @@ export async function sendSessionMessage(sessionId: string, message: string) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ message }),
+    signal: options?.signal,
   })
 
   let result: { message?: string; error?: string; ok?: boolean } = {}

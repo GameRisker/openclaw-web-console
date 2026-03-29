@@ -564,7 +564,8 @@ textarea {
   flex: 0 1 auto;
   width: fit-content;
   max-width: min(100%, 720px);
-  min-width: 0;
+  /* 相对消息列表（聊天列）宽度，短文本气泡也至少占约 70% */
+  min-width: min(70%, 100%);
   box-sizing: border-box;
 }
 
@@ -764,36 +765,14 @@ textarea {
   margin-top: -2px;
 }
 
-.streaming-status {
+.composer-elapsed {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
-  gap: 6px;
-  margin-top: 8px;
-  color: #93c5fd;
-  font-size: 12px;
-}
-
-.streaming-cursor {
-  display: inline-block;
-  color: #93c5fd;
-  animation: pulse-cursor 1s steps(2, start) infinite;
-}
-
-.streaming-timer {
   color: #7dd3fc;
+  font-size: 11px;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
-}
-
-@keyframes pulse-cursor {
-  0% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.2;
-  }
-  100% {
-    opacity: 1;
-  }
 }
 
 .composer {
@@ -1032,11 +1011,18 @@ textarea {
     gap: 10px;
   }
 
-  .message-row .message-card,
-  .message-card {
+  .message-row .message-card {
+    width: fit-content;
+    min-width: min(70%, 100%);
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  .message-list > .message-card {
     width: 100%;
     min-width: 0;
     max-width: 100%;
+    box-sizing: border-box;
   }
 
   .composer {
