@@ -77,6 +77,7 @@
 | [backend-gateway-realtime-requirements.md](./backend-gateway-realtime-requirements.md) | `chat.event`、timeline、`runStatus`、与历史一致 |
 | [backend-history-cache-proposal.md](./backend-history-cache-proposal.md) | 历史读路径缓存与性能（非阻塞功能） |
 | [webui-timeline-architecture.md](./webui-timeline-architecture.md) | 前端时间线消费背景 |
+| [web-console-slash-commands-contract.md](./web-console-slash-commands-contract.md) | 斜杠命令：`POST message` 契约、`GET /api/commands` 与网关分工 |
 
 ---
 
@@ -92,7 +93,8 @@
 
 - **WS 首包 `limit`**：与 `HISTORY_PAGE_DEFAULT` 一致，当前 **20**（与 `history.ts` 的 `HISTORY_PAGE_SIZE` 对齐）。  
 - **`connect` scopes**：默认请求 `operator.read`、`operator.write`、**`operator.admin`**（缓解联调中 `missing scope: operator.admin`）；可通过环境变量 **`OPENCLAW_WEB_GATEWAY_SCOPES`**（逗号分隔）覆盖，例如仅 `operator.read,operator.write`。  
-- 历史分页透传、`hasMore` 合并规则、进程内 LRU 等见 [session-history-pagination.md](./session-history-pagination.md) §9、[backend-history-cache-proposal.md](./backend-history-cache-proposal.md)。
+- 历史分页透传、`hasMore` 合并规则、进程内 LRU 等见 [session-history-pagination.md](./session-history-pagination.md) §9、[backend-history-cache-proposal.md](./backend-history-cache-proposal.md)。  
+- **斜杠命令**：`GET /api/commands`、`GET /api/sessions/:id/commands` 与静态配置 `openclaw-web-api/web-slash-commands.json`；详见 [web-console-slash-commands-contract.md](./web-console-slash-commands-contract.md)。
 
 ---
 

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "authorityNote": "列表仅供 Web 补全；是否识别、如何执行以 Gateway / 会话侧与 TUI 一致实现为准，请与现网 OpenClaw 文档或源码对齐后更新本文件。",
+  "commands": [
+    {
+      "trigger": "/help",
+      "description": "显示帮助或可用命令摘要",
+      "showInWeb": true
+    },
+    {
+      "trigger": "/model",
+      "description": "查看或切换模型",
+      "showInWeb": true,
+      "argStyle": "space_separated",
+      "argHint": "[子命令或模型标识]",
+      "examples": ["/model", "/model list"]
+    },
+    {
+      "trigger": "/reset",
+      "description": "重置当前会话上下文（语义以网关为准）",
+      "showInWeb": true
+    },
+    {
+      "trigger": "/clear",
+      "description": "清空或压缩上下文（语义以网关为准）",
+      "showInWeb": true
+    },
+    {
+      "trigger": "/compact",
+      "description": "触发上下文压缩/摘要（若网关支持）",
+      "showInWeb": true
+    },
+    {
+      "trigger": "/verbose",
+      "description": "切换详细输出 / verbose 级别",
+      "showInWeb": true,
+      "argStyle": "space_separated",
+      "argHint": "[on|off|级别]"
+    },
+    {
+      "trigger": "/thinking",
+      "description": "调整思考/推理深度（若网关支持）",
+      "showInWeb": true,
+      "argStyle": "space_separated",
+      "argHint": "[级别]"
+    },
+    {
+      "trigger": "/skills",
+      "description": "列出或管理技能（若网关支持）",
+      "showInWeb": true,
+      "argStyle": "space_separated"
+    },
+    {
+      "trigger": "/memory",
+      "description": "记忆相关子命令（若网关支持）",
+      "showInWeb": true,
+      "argStyle": "space_separated"
+    },
+    {
+      "trigger": "/abort",
+      "description": "中止当前生成（与工具栏 Stop 可能等价；以网关为准）",
+      "showInWeb": false
+    }
+  ]
+}

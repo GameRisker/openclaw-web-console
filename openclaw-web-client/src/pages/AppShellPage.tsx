@@ -4,6 +4,12 @@ import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { useAppState } from '../state/useAppState'
 import { openclawWebLog } from '../state/debugLog'
+import {
+  countSlashMenuEntries,
+  filterRootSlashCommands,
+  getSlashTokenAtCursor,
+  type SlashCommand,
+} from '../lib/slashCommands'
 import { isUserFacingRole } from '../utils/roles'
 import type { ApiMessage } from '../types/api'
 
@@ -376,9 +382,15 @@ export function AppShellPage() {
   } = useAppState()
 
   const messageListRef = useRef<HTMLDivElement | null>(null)
+  const composerRef = useRef<HTMLTextAreaElement | null>(null)
   const shouldStickToBottomRef = useRef(true)
   const previousSessionIdRef = useRef(activeSession.id)
   const [showJumpToBottom, setShowJumpToBottom] = useState(false)
+  const [composerCursor, setComposerCursor] = useState(0)
+  const [slashMenuSuppressed, setSlashMenuSuppressed] = useState(false)
+  const [slashHighlightIndex, setSlashHighlightIndex] = useState(0)
+  /** 非 null 时表示正在选该顶层命令的子项（与 TUI 二级菜单类似） */
+  const [slashParentForSubmenu, setSlashParentForSubmenu] = useState<SlashCommand | null>(null)
 
   const runtimeBadge = getRuntimeBadge(state.toolActivityStatus)
   const sendButton = getSendButtonMeta(state.sendStatus)
@@ -473,6 +485,43 @@ export function AppShellPage() {
     const timer = window.setInterval(tick, 200)
     return () => window.clearInterval(timer)
   }, [state.currentRunStartedAt, state.sendStatus, modelSideStreaming])
+
+  useEffect(() => {
+    setComposerCursor(currentDraft.length)
+    setSlashMenuSuppressed(false)
+    setSlashParentForSubmenu(null)
+  }, [activeSession.id])
+
+  const slashToken = useMemo(
+    () => getSlashTokenAtCursor(currentDraft, composerCursor),
+    [currentDraft, composerCursor],
+  )
+
+  const slashListItems = useMemo(() => {
+    if (slashParentForSubmenu?.children?.length) return slashParentForSubmenu.children
+    if (slashToken) return filterRootSlashCommands(slashToken.query)
+    return []
+  }, [slashParentForSubmenu, slashToken])
+
+  const slashPickerOpen =
+    !slashMenuSuppressed && (Boolean(slashToken) || slashParentForSubmenu != null)
+
+  useEffect(() => {
+    if (!slashParentForSubmenu) return
+    const needle = `${slashParentForSubmenu.trigger} `
+    if (!currentDraft.includes(needle)) setSlashParentForSubmenu(null)
+  }, [currentDraft, slashParentForSubmenu])
+
+  useEffect(() => {
+    setSlashHighlightIndex(0)
+  }, [slashToken?.query, slashParentForSubmenu?.trigger])
+
+  useEffect(() => {
+    setSlashHighlightIndex((i) =>
+      slashListItems.length === 0 ? 0 : Math.min(i, slashListItems.length - 1),
+    )
+  }, [slashListItems.length])
+
   useEffect(() => {
     const node = messageListRef.current
     if (!node) return
@@ -587,7 +636,152 @@ export function AppShellPage() {
     node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' })
   }
 
+  function enterSlashSubmenu(parent: SlashCommand) {
+    const ta = composerRef.current
+    const text = currentDraft
+    const cur = ta?.selectionStart ?? composerCursor
+    const t = getSlashTokenAtCursor(text, cur)
+    if (!t) return
+    const before = text.slice(0, t.start)
+    const after = text.slice(t.end)
+    const insert = `${parent.trigger} `
+    const next = before + insert + after
+    setDraft(next)
+    const newPos = t.start + insert.length
+    setComposerCursor(newPos)
+    setSlashParentForSubmenu(parent)
+    setSlashHighlightIndex(0)
+    setSlashMenuSuppressed(false)
+    requestAnimationFrame(() => {
+      ta?.focus()
+      ta?.setSelectionRange(newPos, newPos)
+    })
+  }
+
+  function exitSlashSubmenu(parent: SlashCommand) {
+    const ta = composerRef.current
+    const text = currentDraft
+    const suffix = `${parent.trigger} `
+    const idx = text.lastIndexOf(suffix)
+    if (idx >= 0) {
+      const next = text.slice(0, idx) + parent.trigger + text.slice(idx + suffix.length)
+      setDraft(next)
+      const pos = idx + parent.trigger.length
+      setComposerCursor(pos)
+      setSlashParentForSubmenu(null)
+      setSlashHighlightIndex(0)
+      requestAnimationFrame(() => {
+        ta?.focus()
+        ta?.setSelectionRange(pos, pos)
+      })
+    } else {
+      setSlashParentForSubmenu(null)
+    }
+  }
+
+  /** 顶层叶子：替换当前 / 词为完整命令 */
+  function applySlashRootLeaf(item: SlashCommand) {
+    const ta = composerRef.current
+    const text = currentDraft
+    const cur = ta?.selectionStart ?? composerCursor
+    const t = getSlashTokenAtCursor(text, cur)
+    if (!t) return
+    const before = text.slice(0, t.start)
+    const after = text.slice(t.end)
+    const raw = item.insertText ?? item.trigger
+    const needsGap = after.length === 0 || !/^\s/.test(after[0]!)
+    const insert = needsGap ? `${raw} ` : raw
+    const next = before + insert + after
+    setDraft(next)
+    const newPos = t.start + insert.length
+    setComposerCursor(newPos)
+    setSlashMenuSuppressed(false)
+    setSlashParentForSubmenu(null)
+    requestAnimationFrame(() => {
+      ta?.focus()
+      ta?.setSelectionRange(newPos, newPos)
+    })
+  }
+
+  function applySlashChildCompletion(child: SlashCommand) {
+    const parent = slashParentForSubmenu
+    if (!parent) return
+    const ta = composerRef.current
+    const text = currentDraft
+    const cur = ta?.selectionStart ?? composerCursor
+    const prefix = `${parent.trigger} `
+    const i = text.lastIndexOf(prefix)
+    if (i < 0) return
+    const insert = `${child.insertText ?? `${parent.trigger} ${child.trigger}`} `
+    const next = text.slice(0, i) + insert + text.slice(cur)
+    setDraft(next)
+    const newPos = i + insert.length
+    setComposerCursor(newPos)
+    setSlashParentForSubmenu(null)
+    setSlashMenuSuppressed(false)
+    requestAnimationFrame(() => {
+      ta?.focus()
+      ta?.setSelectionRange(newPos, newPos)
+    })
+  }
+
+  function applySlashPick(item: SlashCommand) {
+    if (item.children?.length) enterSlashSubmenu(item)
+    else applySlashRootLeaf(item)
+  }
+
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    const ta = event.currentTarget
+    const cur = ta.selectionStart ?? 0
+    const token = getSlashTokenAtCursor(currentDraft, cur)
+    const inSub = slashParentForSubmenu != null
+    const items = inSub
+      ? (slashParentForSubmenu!.children ?? [])
+      : token
+        ? filterRootSlashCommands(token.query)
+        : []
+    const pickerActive = !slashMenuSuppressed && (Boolean(token) || inSub)
+
+    if (pickerActive && items.length > 0) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setSlashHighlightIndex((i) => (i + 1) % items.length)
+        return
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setSlashHighlightIndex((i) => (i - 1 + items.length) % items.length)
+        return
+      }
+      if (event.key === 'Tab') {
+        event.preventDefault()
+        const pick = items[slashHighlightIndex] ?? items[0]!
+        if (inSub) applySlashChildCompletion(pick)
+        else applySlashPick(pick)
+        return
+      }
+      if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+        event.preventDefault()
+        const pick = items[slashHighlightIndex] ?? items[0]!
+        if (inSub) applySlashChildCompletion(pick)
+        else applySlashPick(pick)
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        if (inSub && slashParentForSubmenu) exitSlashSubmenu(slashParentForSubmenu)
+        else setSlashMenuSuppressed(true)
+        return
+      }
+    }
+
+    if (pickerActive && items.length === 0 && event.key === 'Escape') {
+      event.preventDefault()
+      if (inSub && slashParentForSubmenu) exitSlashSubmenu(slashParentForSubmenu)
+      else setSlashMenuSuppressed(true)
+      return
+    }
+
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault()
       void sendCurrentMessage(false)
@@ -880,14 +1074,100 @@ export function AppShellPage() {
             </div>
 
             <div className="composer-row">
-              <textarea
-                className="composer-input"
-                placeholder="在这里输入消息…"
-                rows={3}
-                value={currentDraft}
-                onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={handleComposerKeyDown}
-              />
+              <div className="composer-input-wrap">
+                <textarea
+                  ref={composerRef}
+                  className="composer-input"
+                  placeholder="在这里输入消息…（输入 / 查看命令）"
+                  rows={3}
+                  value={currentDraft}
+                  aria-expanded={slashPickerOpen}
+                  aria-controls="composer-slash-listbox"
+                  aria-autocomplete="list"
+                  onChange={(event) => {
+                    setSlashMenuSuppressed(false)
+                    setDraft(event.target.value)
+                    setComposerCursor(event.target.selectionStart)
+                  }}
+                  onSelect={(event) => {
+                    setComposerCursor(event.currentTarget.selectionStart)
+                  }}
+                  onClick={(event) => {
+                    setComposerCursor(event.currentTarget.selectionStart)
+                  }}
+                  onKeyUp={(event) => {
+                    setComposerCursor(event.currentTarget.selectionStart)
+                  }}
+                  onKeyDown={handleComposerKeyDown}
+                />
+                {slashPickerOpen && (
+                  <div
+                    id="composer-slash-listbox"
+                    className="composer-slash-menu"
+                    role="listbox"
+                    aria-label="Slash 命令"
+                  >
+                    {slashParentForSubmenu && (
+                      <div className="composer-slash-breadcrumb">
+                        <button
+                          type="button"
+                          className="composer-slash-back"
+                          onMouseDown={(e) => {
+                            e.preventDefault()
+                            exitSlashSubmenu(slashParentForSubmenu)
+                          }}
+                        >
+                          ← 返回
+                        </button>
+                        <span className="composer-slash-breadcrumb-title">
+                          {slashParentForSubmenu.trigger}
+                        </span>
+                      </div>
+                    )}
+                    {slashListItems.length === 0 ? (
+                      <div className="composer-slash-empty" role="presentation">
+                        {slashParentForSubmenu ? '暂无子命令' : '无匹配命令'}
+                      </div>
+                    ) : (
+                      <>
+                        {slashListItems.map((cmd, index) => {
+                          const hasKids = Boolean(cmd.children?.length)
+                          return (
+                            <button
+                              key={
+                                slashParentForSubmenu
+                                  ? `${slashParentForSubmenu.trigger}:${cmd.trigger}:${index}`
+                                  : cmd.trigger
+                              }
+                              type="button"
+                              role="option"
+                              aria-selected={index === slashHighlightIndex}
+                              className={`composer-slash-item ${index === slashHighlightIndex ? 'is-active' : ''} ${hasKids ? 'has-children' : ''}`}
+                              onMouseDown={(e) => {
+                                e.preventDefault()
+                                if (slashParentForSubmenu) applySlashChildCompletion(cmd)
+                                else applySlashPick(cmd)
+                              }}
+                              onMouseEnter={() => setSlashHighlightIndex(index)}
+                            >
+                              <span className="composer-slash-trigger">
+                                {cmd.trigger}
+                                {hasKids ? <span className="composer-slash-chevron"> ▸</span> : null}
+                              </span>
+                              <span className="composer-slash-desc">{cmd.description}</span>
+                            </button>
+                          )
+                        })}
+                        {!slashParentForSubmenu && (
+                          <div className="composer-slash-footer" role="note">
+                            共 {countSlashMenuEntries()} 条（含子命令）；与 TUI 完全一致需网关下发命令树
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
               <button
                 type="button"
                 className={`${sendButton.className} composer-send-button`}

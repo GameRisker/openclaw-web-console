@@ -1203,6 +1203,113 @@ app.get('/api/status', async (_req, res) => {
   }
 })
 
+/** 斜杠命令补全列表；见 docs/web-console-slash-commands-contract.md */
+const DEFAULT_SLASH_FALLBACK = [
+  { trigger: '/help', description: '显示帮助', showInWeb: true },
+  { trigger: '/model', description: '模型相关', showInWeb: true, argStyle: 'space_separated' },
+  { trigger: '/reset', description: '重置会话上下文（语义以网关为准）', showInWeb: true },
+]
+
+let slashCommandsCatalogCache = null
+
+function normalizeSlashCommandEntries(entries) {
+  if (!Array.isArray(entries)) return []
+  return entries
+    .filter((e) => e && typeof e.trigger === 'string' && e.trigger.trim() !== '')
+    .map((e) => {
+      const t = e.trigger.trim()
+      const trigger = t.startsWith('/') ? t : `/${t}`
+      const out = {
+        trigger,
+        description: String(e.description ?? ''),
+        showInWeb: e.showInWeb !== false,
+      }
+      if (e.argStyle != null && String(e.argStyle) !== '') out.argStyle = String(e.argStyle)
+      if (e.argHint != null && String(e.argHint) !== '') out.argHint = String(e.argHint)
+      if (Array.isArray(e.examples) && e.examples.length) out.examples = e.examples.map((x) => String(x))
+      return out
+    })
+}
+
+async function loadSlashCommandsCatalog() {
+  if (slashCommandsCatalogCache) return slashCommandsCatalogCache
+
+  const envPath = process.env.OPENCLAW_WEB_SLASH_COMMANDS_JSON?.trim()
+  const tryPaths = []
+  if (envPath) {
+    tryPaths.push(path.isAbsolute(envPath) ? envPath : path.resolve(process.cwd(), envPath))
+  }
+  tryPaths.push(path.join(__dirname, 'web-slash-commands.json'))
+
+  for (const filePath of tryPaths) {
+    try {
+      const raw = await fs.readFile(filePath, 'utf8')
+      const parsed = JSON.parse(raw)
+      const arr = Array.isArray(parsed) ? parsed : parsed.commands
+      if (Array.isArray(arr) && arr.length) {
+        slashCommandsCatalogCache = {
+          schemaVersion: typeof parsed.schemaVersion === 'number' ? parsed.schemaVersion : 1,
+          authorityNote:
+            typeof parsed.authorityNote === 'string'
+              ? parsed.authorityNote
+              : '命令是否生效以 Gateway / TUI 为准；本列表仅供 Web 补全。',
+          commands: normalizeSlashCommandEntries(arr),
+        }
+        return slashCommandsCatalogCache
+      }
+    } catch (err) {
+      if (envPath && filePath === tryPaths[0]) {
+        console.warn('[openclaw-web-api] OPENCLAW_WEB_SLASH_COMMANDS_JSON failed:', filePath, err?.message ?? err)
+      }
+    }
+  }
+
+  slashCommandsCatalogCache = {
+    schemaVersion: 1,
+    authorityNote: '使用内置回退列表；可配置 web-slash-commands.json 或 OPENCLAW_WEB_SLASH_COMMANDS_JSON。',
+    commands: normalizeSlashCommandEntries(DEFAULT_SLASH_FALLBACK),
+  }
+  return slashCommandsCatalogCache
+}
+
+function buildSlashCommandsResponse(catalog, sessionMeta = {}) {
+  const visible = catalog.commands.filter((c) => c.showInWeb)
+  return {
+    schemaVersion: catalog.schemaVersion,
+    source: 'openclaw-web-api',
+    authorityNote: catalog.authorityNote,
+    commands: visible,
+    ...sessionMeta,
+  }
+}
+
+app.get('/api/commands', async (_req, res) => {
+  try {
+    const catalog = await loadSlashCommandsCatalog()
+    res.json(buildSlashCommandsResponse(catalog))
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'commands_failed' })
+  }
+})
+
+app.get('/api/sessions/:sessionId/commands', async (req, res) => {
+  try {
+    const session = await resolveSession(req.params.sessionId)
+    const catalog = await loadSlashCommandsCatalog()
+    res.json(
+      buildSlashCommandsResponse(catalog, {
+        sessionId: req.params.sessionId,
+        sessionKey: session.key,
+      }),
+    )
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error ? error.code : undefined
+    res
+      .status(code === 'session_not_found' ? 404 : 500)
+      .json({ error: error instanceof Error ? error.message : 'commands_failed' })
+  }
+})
+
 app.get('/api/sessions', async (_req, res) => {
   try {
     const result = await listSessions()
