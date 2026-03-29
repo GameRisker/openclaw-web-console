@@ -1,4 +1,5 @@
 import type { RealtimeEvent } from '../types/api'
+import { openclawWebLog } from './debugLog'
 
 interface RealtimeOptions {
   onEvent: (event: RealtimeEvent) => void
@@ -7,34 +8,45 @@ interface RealtimeOptions {
 
 export function connectRealtime({ onEvent, onStatusChange }: RealtimeOptions) {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const ws = new WebSocket(`${protocol}//${window.location.host}/api/realtime`)
+  const url = `${protocol}//${window.location.host}/api/realtime`
+  openclawWebLog('realtime connecting', url)
+  const ws = new WebSocket(url)
 
   onStatusChange?.('connecting')
 
   ws.onopen = () => {
+    openclawWebLog('realtime open')
     onStatusChange?.('connected')
   }
 
   ws.onmessage = (message) => {
     try {
-      onEvent(JSON.parse(message.data) as RealtimeEvent)
+      const parsed = JSON.parse(message.data) as RealtimeEvent
+      openclawWebLog('realtime message', parsed)
+      onEvent(parsed)
     } catch {
-      // ignore malformed events
+      openclawWebLog('realtime message (parse error)', String(message.data).slice(0, 500))
     }
   }
 
   ws.onerror = () => {
+    openclawWebLog('realtime error')
     onStatusChange?.('error')
   }
 
   ws.onclose = () => {
+    openclawWebLog('realtime close')
     onStatusChange?.('disconnected')
   }
 
   return {
     socket: ws,
     subscribe(sessionId: string) {
-      const send = () => ws.send(JSON.stringify({ type: 'subscribe', sessionId }))
+      const send = () => {
+        const frame = JSON.stringify({ type: 'subscribe', sessionId })
+        openclawWebLog('realtime subscribe send', { sessionId })
+        ws.send(frame)
+      }
       if (ws.readyState === WebSocket.OPEN) {
         send()
       } else {

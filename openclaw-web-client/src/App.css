@@ -11,6 +11,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  overflow-x: hidden;
   background:
     radial-gradient(circle at top left, rgba(37, 99, 235, 0.18), transparent 30%),
     linear-gradient(180deg, #0b1220 0%, #101a2f 100%);
@@ -160,8 +161,18 @@ textarea {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
+  width: 100%;
+  max-width: 100vw;
+  margin-inline: auto;
   padding: clamp(12px, 2vw, 24px);
+  padding-top: max(clamp(12px, 2vw, 24px), env(safe-area-inset-top, 0px));
+  padding-left: max(clamp(12px, 2vw, 24px), env(safe-area-inset-left, 0px));
+  padding-right: max(clamp(12px, 2vw, 24px), env(safe-area-inset-right, 0px));
+  padding-bottom: max(clamp(12px, 2vw, 24px), env(safe-area-inset-bottom, 0px));
   overflow: hidden;
+  overflow-x: hidden;
+  box-sizing: border-box;
 }
 
 .topbar {
@@ -175,6 +186,12 @@ textarea {
   background: rgba(15, 23, 42, 0.9);
   box-shadow: 0 14px 36px rgba(15, 23, 42, 0.28);
   flex: 0 0 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.topbar > div:first-child {
+  min-width: 0;
 }
 
 .topbar-statuses {
@@ -226,21 +243,24 @@ textarea {
 
 .console-grid {
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr) minmax(260px, 320px);
-  gap: 16px;
+  grid-template-columns: minmax(220px, 248px) minmax(0, 1fr) minmax(240px, min(320px, 24vw));
+  gap: clamp(10px, 1.5vw, 16px);
   margin-top: 12px;
   flex: 1 1 auto;
   min-height: 0;
+  min-width: 0;
+  max-width: 100%;
   height: 0;
   position: relative;
+  overflow-x: hidden;
 }
 
 .console-grid.left-collapsed {
-  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  grid-template-columns: minmax(0, 1fr) minmax(240px, min(320px, 24vw));
 }
 
 .console-grid.right-collapsed {
-  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-columns: minmax(220px, 248px) minmax(0, 1fr);
 }
 
 .console-grid.left-collapsed.right-collapsed {
@@ -251,6 +271,7 @@ textarea {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
   height: 100%;
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 24px;
@@ -298,23 +319,79 @@ textarea {
 }
 
 .compact-sidebar-header {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
   padding-bottom: 10px;
+}
+
+.sidebar-panel-title {
+  min-width: 0;
+}
+
+.sidebar-panel-title h2 {
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.sidebar-panel .sidebar-panel-toolbar {
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sidebar-panel .sidebar-icon-btn {
+  padding: 4px 6px;
+  font-size: 12px;
+  line-height: 1;
+  min-width: 30px;
+  min-height: 30px;
+  border-radius: 8px;
 }
 
 .compact-session-list {
   gap: 10px;
 }
 
-.left-sidebar-toggle.floating {
+/* 折叠会话栏：贴在聊天面板左缘的窄条，不盖住消息区 */
+.left-sidebar-edge-tab {
   position: absolute;
-  left: 12px;
-  top: 12px;
-  z-index: 5;
-  padding: 8px 12px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.92);
-  color: #e2e8f0;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 6;
+  width: 11px;
+  min-height: 52px;
+  padding: 0 0 0 1px;
+  margin: 0;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-left: none;
+  border-radius: 0 10px 10px 0;
+  background: rgba(15, 23, 42, 0.94);
+  color: #93c5fd;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 2px 0 10px rgba(15, 23, 42, 0.35);
+}
+
+.left-sidebar-edge-tab:hover {
+  background: rgba(37, 99, 235, 0.22);
+  color: #bfdbfe;
+}
+
+.left-sidebar-edge-tab:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
+}
+
+.left-sidebar-edge-tab-icon {
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.95;
+  transform: scaleX(0.85);
+  pointer-events: none;
 }
 
 .context-cards {
@@ -364,6 +441,8 @@ textarea {
   height: 72px;
   min-height: 72px;
   max-height: 72px;
+  overflow: hidden;
+  min-width: 0;
 }
 
 .session-card h3,
@@ -384,6 +463,10 @@ textarea {
   color: #e2e8f0;
   font-size: 14px;
   line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .session-subtitle {
@@ -406,13 +489,29 @@ textarea {
 }
 
 .chat-panel {
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto auto;
   gap: 0;
   overflow: hidden;
+  overflow-x: hidden;
   height: 100%;
   min-height: 0;
   min-width: 0;
+  max-width: 100%;
+}
+
+/* Grid 列宽曾被「不换行的 composer 元信息」撑开，导致整列 min-content 超出视口、用户气泡贴到屏外 */
+.chat-panel > * {
+  min-width: 0;
+}
+
+/* 左缘箭头不占文档流，给主内容略加左内边距避免与窄条叠字 */
+.chat-panel.chat-panel--sessions-collapsed .chat-header,
+.chat-panel.chat-panel--sessions-collapsed .message-list,
+.chat-panel.chat-panel--sessions-collapsed .jump-to-bottom-wrap,
+.chat-panel.chat-panel--sessions-collapsed .composer {
+  padding-left: calc(14px + 12px);
 }
 
 .chat-header {
@@ -460,14 +559,30 @@ textarea {
   box-sizing: border-box;
 }
 
-/* 会话气泡统一：禁止 flex 压扁、短内容最小宽度、长内容上限（用户右对齐 / 助手左对齐仅由 .message-row 决定） */
+/* 气泡：允许在窄列内收缩；勿 flex-shrink:0 + nowrap 祖先，否则用户消息会被挤出视口右侧 */
 .message-row .message-card {
-  flex: 0 0 auto;
-  flex-shrink: 0;
+  flex: 0 1 auto;
   width: fit-content;
-  max-width: min(100%, 85%, 720px);
-  min-width: min(240px, 100%);
+  max-width: min(100%, 720px);
+  min-width: 0;
   box-sizing: border-box;
+}
+
+.message-row.user .message-card {
+  max-width: min(100%, 720px);
+}
+
+/* 宽屏：对话区更宽时允许气泡略增，仍限制行长便于阅读 */
+@media (min-width: 1440px) {
+  .message-row .message-card {
+    max-width: min(100%, 800px);
+  }
+}
+
+@media (min-width: 1920px) {
+  .message-row .message-card {
+    max-width: min(100%, 920px);
+  }
 }
 
 .message-card-header {
@@ -614,6 +729,10 @@ textarea {
   border: 1px solid rgba(148, 163, 184, 0.12);
   font-size: 10px;
   flex: 0 0 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .runtime-banner.info {
@@ -688,6 +807,9 @@ textarea {
   background: rgba(15, 23, 42, 0.98);
   box-shadow: 0 -6px 14px rgba(15, 23, 42, 0.2);
   min-height: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .jump-to-bottom-wrap {
@@ -709,6 +831,8 @@ textarea {
   justify-content: space-between;
   align-items: flex-start;
   gap: 8px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .composer-meta {
@@ -729,10 +853,14 @@ textarea {
 .composer-meta.single-line {
   white-space: nowrap;
   overflow: hidden;
+  max-width: 100%;
 }
 
+/* flex 子项默认 min-width:auto，长 session id 会撑开整列 grid */
 .composer-meta.single-line .composer-hint,
 .composer-meta.single-line .composer-error {
+  flex: 1 1 0;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -792,10 +920,11 @@ textarea {
   gap: 16px;
 }
 
-@media (max-width: 1200px) {
+/* 中等宽度：仍保留会话 + 聊天 + 右侧栏，直至较窄再收起 Context */
+@media (max-width: 1080px) {
   .console-grid,
   .console-grid.right-collapsed {
-    grid-template-columns: 232px minmax(0, 1fr);
+    grid-template-columns: minmax(200px, 228px) minmax(0, 1fr);
   }
 
   .console-grid.left-collapsed,
@@ -805,6 +934,38 @@ textarea {
 
   .context-panel {
     display: none;
+  }
+}
+
+/* 介于「三栏」与「收起 Context」之间：压缩侧栏、右侧栏略窄 */
+@media (min-width: 1081px) and (max-width: 1279px) {
+  .console-grid:not(.right-collapsed) {
+    grid-template-columns: minmax(200px, 236px) minmax(0, 1fr) minmax(220px, 280px);
+  }
+}
+
+/* 大屏：整页居中，避免超宽显示器两侧留白失衡、中间栏无限拉宽 */
+@media (min-width: 1536px) {
+  .console-page {
+    max-width: min(100vw - 32px, 2200px);
+  }
+
+  .console-grid:not(.left-collapsed):not(.right-collapsed) {
+    grid-template-columns: minmax(244px, 268px) minmax(0, 1fr) minmax(280px, min(360px, 20vw));
+  }
+
+  .console-grid.left-collapsed {
+    grid-template-columns: minmax(0, 1fr) minmax(280px, min(380px, 22vw));
+  }
+
+  .console-grid.right-collapsed {
+    grid-template-columns: minmax(244px, 268px) minmax(0, 1fr);
+  }
+}
+
+@media (min-width: 1920px) {
+  .console-page {
+    max-width: min(100vw - 48px, 2400px);
   }
 }
 
@@ -821,6 +982,10 @@ textarea {
   .console-page {
     overflow: hidden;
     padding: 8px;
+    padding-top: max(8px, env(safe-area-inset-top, 0px));
+    padding-left: max(8px, env(safe-area-inset-left, 0px));
+    padding-right: max(8px, env(safe-area-inset-right, 0px));
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
   }
 
   .topbar {
@@ -842,9 +1007,9 @@ textarea {
     display: none;
   }
 
-  .left-sidebar-toggle.floating {
-    left: 8px;
-    top: 8px;
+  .left-sidebar-edge-tab {
+    min-height: 48px;
+    width: 12px;
   }
 
   .panel,
@@ -897,10 +1062,61 @@ textarea {
   }
 
   .settings-drawer {
-    top: 12px;
-    right: 12px;
-    bottom: 12px;
-    left: 12px;
+    top: max(12px, env(safe-area-inset-top, 0px));
+    right: max(12px, env(safe-area-inset-right, 0px));
+    bottom: max(12px, env(safe-area-inset-bottom, 0px));
+    left: max(12px, env(safe-area-inset-left, 0px));
     width: auto;
+  }
+}
+
+/* 窄屏手机：再压缩顶栏与卡片，避免横向溢出 */
+@media (max-width: 480px) {
+  .topbar h1 {
+    font-size: 18px;
+    line-height: 1.25;
+  }
+
+  .eyebrow {
+    font-size: 11px;
+    padding: 5px 10px;
+  }
+
+  .status-pill,
+  .mini-state {
+    font-size: 11px;
+    padding: 5px 8px;
+  }
+
+  .session-card {
+    height: auto;
+    min-height: 64px;
+    max-height: none;
+    padding: 10px;
+  }
+
+  .chat-header h2 {
+    font-size: 16px;
+  }
+
+  .composer-row {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
+  }
+
+  .composer-send-button {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .primary-button,
+  .secondary-button {
+    min-height: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message-list {
+    scroll-behavior: auto;
   }
 }

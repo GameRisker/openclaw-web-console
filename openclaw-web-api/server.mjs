@@ -230,7 +230,14 @@ function flattenContent(content, parentRole = 'assistant') {
     .join('\n')
 }
 
-const DEBUG_WEBUI_BRIDGE = true
+/** 设为 0 / false 可关闭桥接调试输出；默认开启 */
+const DEBUG_WEBUI_BRIDGE = !['0', 'false', 'no'].includes(
+  String(process.env.OPENCLAW_WEB_BRIDGE_LOG ?? '').toLowerCase(),
+)
+
+if (DEBUG_WEBUI_BRIDGE) {
+  console.log('[webui-bridge] 调试日志已开启（终端）。关闭: OPENCLAW_WEB_BRIDGE_LOG=0 node server.mjs')
+}
 
 function bridgeLog(event, details = {}) {
   if (!DEBUG_WEBUI_BRIDGE) return

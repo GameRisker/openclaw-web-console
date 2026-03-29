@@ -146,8 +146,6 @@ export function AppShellPage() {
     .join(' | ')
 
   const visibleMessages = messages
-  const hasRealtimeBanner = ['connecting', 'reconnecting', 'degraded', 'disconnected'].includes(state.connectionStatus)
-  const hasRunBanner = ['queued', 'waiting-response', 'completed', 'stopped', 'error'].includes(state.sendStatus)
 
   useEffect(() => {
     const runFinished =
@@ -260,27 +258,23 @@ export function AppShellPage() {
       <section
         className={`console-grid ${state.isLeftSidebarCollapsed ? 'left-collapsed' : ''} ${state.isRightSidebarCollapsed ? 'right-collapsed' : ''}`}
       >
-        {state.isLeftSidebarCollapsed && (
-          <button className="left-sidebar-toggle floating" onClick={toggleLeftSidebar}>
-            ☰ Sessions
-          </button>
-        )}
-
         {!state.isLeftSidebarCollapsed && (
           <aside className="panel sidebar-panel">
             <div className="panel-header compact-sidebar-header">
-              <div>
+              <div className="sidebar-panel-title">
                 <h2>Sessions</h2>
               </div>
-              <div className="panel-header-actions">
-                <button className="icon-button" onClick={toggleLeftSidebar}>
+              <div className="panel-header-actions sidebar-panel-toolbar">
+                <button type="button" className="icon-button sidebar-icon-btn" onClick={toggleLeftSidebar} title="收起列表">
                   ◀
                 </button>
-                <button className="icon-button" onClick={refreshHistory}>
+                <button type="button" className="icon-button sidebar-icon-btn" onClick={refreshHistory} title="刷新历史">
                   ↻
                 </button>
                 <button
-                  className="icon-button"
+                  type="button"
+                  className="icon-button sidebar-icon-btn"
+                  title="新建会话"
                   onClick={async () => {
                     const nextName = window.prompt('Session name')?.trim()
                     if (!nextName) return
@@ -321,7 +315,23 @@ export function AppShellPage() {
           </aside>
         )}
 
-        <section className="panel chat-panel">
+        <section
+          className={`panel chat-panel${state.isLeftSidebarCollapsed ? ' chat-panel--sessions-collapsed' : ''}`}
+        >
+          {state.isLeftSidebarCollapsed && (
+            <button
+              type="button"
+              className="left-sidebar-edge-tab"
+              onClick={toggleLeftSidebar}
+              aria-label="展开会话列表"
+              title="Sessions"
+            >
+              <span className="left-sidebar-edge-tab-icon" aria-hidden>
+                ▶
+              </span>
+            </button>
+          )}
+
           <div className="panel-header chat-header">
             <div className="chat-title-wrap">
               <h2>{activeSession.summary}</h2>
@@ -344,42 +354,6 @@ export function AppShellPage() {
               )}
             </div>
           </div>
-
-
-          {hasRealtimeBanner && (
-            <div
-              className={`runtime-banner ${
-                state.connectionStatus === 'degraded' || state.connectionStatus === 'disconnected'
-                  ? 'warning'
-                  : 'info'
-              }`}
-            >
-              {state.connectionStatus === 'connecting' && '正在连接 realtime…'}
-              {state.connectionStatus === 'reconnecting' && 'realtime 已断开，正在自动重连…'}
-              {state.connectionStatus === 'degraded' && 'realtime 状态不稳定，可能会短暂回退到刷新历史。'}
-              {state.connectionStatus === 'disconnected' && 'realtime 已离线，等待重新建立连接。'}
-            </div>
-          )}
-
-          {hasRunBanner && (
-            <div
-              className={`runtime-banner ${
-                state.sendStatus === 'completed'
-                  ? 'success'
-                  : state.sendStatus === 'stopped'
-                    ? 'neutral'
-                    : state.sendStatus === 'error'
-                      ? 'danger'
-                      : 'info'
-              }`}
-            >
-              {state.sendStatus === 'queued' && '消息已送出，等待会话开始响应…'}
-              {state.sendStatus === 'waiting-response' && '正在生成回复，流式内容会继续追加到当前消息。'}
-              {state.sendStatus === 'completed' && '本轮回复已完成。'}
-              {state.sendStatus === 'stopped' && '本轮回复已停止。'}
-              {state.sendStatus === 'error' && `本轮回复失败${state.composerError ? `：${state.composerError}` : '。'}`}
-            </div>
-          )}
 
           <div ref={messageListRef} className="message-list" onScroll={handleMessageListScroll}>
             {state.historyStatus === 'loading-history' && visibleMessages.length === 0 && (

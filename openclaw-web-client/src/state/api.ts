@@ -1,4 +1,5 @@
 import type { SessionHistoryResponse, SessionsResponse } from '../types/api'
+import { openclawWebLog } from './debugLog'
 
 export async function fetchSessions() {
   const response = await fetch('/api/sessions')
@@ -7,9 +8,23 @@ export async function fetchSessions() {
 }
 
 export async function fetchSessionHistory(sessionId: string) {
+  openclawWebLog('http history request', { sessionId })
   const response = await fetch(`/api/sessions/${sessionId}/history`)
+  let data: SessionHistoryResponse
+  try {
+    data = (await response.json()) as SessionHistoryResponse
+  } catch {
+    openclawWebLog('http history response (parse error)', { ok: response.ok, status: response.status })
+    throw new Error('failed_to_fetch_history')
+  }
+  openclawWebLog('http history response', {
+    ok: response.ok,
+    status: response.status,
+    messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
+    sessionId: data.sessionId,
+  })
   if (!response.ok) throw new Error('failed_to_fetch_history')
-  return (await response.json()) as SessionHistoryResponse
+  return data
 }
 
 export async function fetchStatus() {
@@ -19,6 +34,10 @@ export async function fetchStatus() {
 }
 
 export async function sendSessionMessage(sessionId: string, message: string) {
+  openclawWebLog('http send request', {
+    sessionId,
+    messagePreview: message.slice(0, 120) + (message.length > 120 ? '…' : ''),
+  })
   const response = await fetch(`/api/sessions/${sessionId}/message`, {
     method: 'POST',
     headers: {
@@ -27,13 +46,16 @@ export async function sendSessionMessage(sessionId: string, message: string) {
     body: JSON.stringify({ message }),
   })
 
-  let result: { message?: string; error?: string } = {}
+  let result: { message?: string; error?: string; ok?: boolean } = {}
   try {
     result = (await response.json()) as typeof result
   } catch {
+    openclawWebLog('http send response (no json)', { ok: response.ok, status: response.status })
     if (!response.ok) throw new Error(`send_failed (${response.status})`)
     return {}
   }
+
+  openclawWebLog('http send response', { ok: response.ok, status: response.status, result })
 
   if (!response.ok) {
     throw new Error(result.message || result.error || `send_failed (${response.status})`)

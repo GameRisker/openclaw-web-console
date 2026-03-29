@@ -13,7 +13,12 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:3001',
+      // 必须 ws: true，否则 /api/realtime 无法升级到后端 WebSocket（浏览器会报 closed before established）
+      '/api': {
+        target: 'http://127.0.0.1:3001',
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
 })
