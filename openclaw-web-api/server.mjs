@@ -19,6 +19,11 @@ import {
   parseHistoryLimit,
   sortMappedHistoryMessages,
 } from './lib/history-service.mjs'
+import { normalizeAgentListItem } from './lib/agent-service.mjs'
+import {
+  applyGatewaySessionPreferencePatch as applyGatewaySessionPreferencePatchImpl,
+  normalizeSession,
+} from './lib/session-service.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -79,49 +84,6 @@ function applyBeforeCursorSanitize(mappedSortedAsc, beforeId) {
 }
 
 app.use(express.json())
-
-function normalizeSessionBool(value) {
-  if (value === true || value === false) return value
-  if (value === 'true' || value === 1) return true
-  if (value === 'false' || value === 0) return false
-  return undefined
-}
-
-/** Web 仅使用 low | high | off；从网关 think / thinkLevel / thinking* 等映射 */
-function normalizeSessionThinkLevel(raw) {
-  if (raw == null || raw === '') return undefined
-  const s = String(raw).trim().toLowerCase().replace(/-/g, '_')
-  if (['low', 'minimal', 'min', 'small'].includes(s)) return 'low'
-  if (['high', 'xhigh', 'max', 'maximum', 'heavy'].includes(s)) return 'high'
-  if (['off', 'none', 'no', 'disabled', 'false', '0'].includes(s)) return 'off'
-  if (['low', 'high', 'off'].includes(s)) return s
-  return undefined
-}
-
-function normalizeSession(item) {
-  const thinkRaw = item.think ?? item.thinkLevel ?? item.thinking ?? item.thinkingLevel
-  const think = normalizeSessionThinkLevel(thinkRaw)
-  const verbose =
-    normalizeSessionBool(item.verbose) ??
-    normalizeSessionBool(item.verboseEnabled) ??
-    normalizeSessionBool(item.isVerbose)
-  return {
-    key: item.key,
-    sessionId: item.sessionId,
-    updatedAt: item.updatedAt,
-    ageMs: item.ageMs,
-    createdAt: item.createdAt,
-    model: item.model,
-    modelProvider: item.modelProvider,
-    totalTokens: item.totalTokens,
-    contextTokens: item.contextTokens,
-    kind: item.kind,
-    label: item.label,
-    displayName: item.displayName,
-    verbose,
-    think,
-  }
-}
 
 /** `provider/model` → { modelProvider, model } */
 
@@ -322,34 +284,6 @@ function parseAgentSlotFromSessionKey(key) {
   if (key == null || typeof key !== 'string') return null
   const m = /^agent:([^:]+):/.exec(key.trim())
   return m ? m[1] : null
-}
-
-function normalizeAgentListItem(item) {
-  if (!item || typeof item !== 'object') return null
-  const id = item.agentId ?? item.id ?? item.key
-  if (id == null || String(id).trim() === '') return null
-  const agentId = String(item.agentId ?? item.id ?? id).trim()
-  return {
-    agentId,
-    id: String(item.id ?? item.agentId ?? agentId).trim(),
-    key: item.key,
-    name: item.name,
-    label: item.label,
-    displayName: item.displayName,
-    description: item.description,
-    status: item.status ?? item.state,
-    state: item.state,
-    updatedAt:
-      typeof item.updatedAt === 'number' && item.updatedAt > 0
-        ? item.updatedAt
-        : toTimestampMs(item.updatedAt),
-    createdAt:
-      typeof item.createdAt === 'number' && item.createdAt > 0
-        ? item.createdAt
-        : toTimestampMs(item.createdAt),
-    model: item.model,
-    modelProvider: item.modelProvider,
-  }
 }
 
 /** 网关未实现 agents.list 时，由 sessions.list 推导 Agent 槽位（与 OpenClaw sessionKey 约定一致） */
@@ -1735,20 +1669,11 @@ function gatewaySessionPatchParams(sessionKey, core) {
 
 /** 对已知 sessionKey 应用 label/model/verbose/think（与 POST /api/sessions/:id/patch 一致） */
 async function applyGatewaySessionPreferencePatch(sessionKey, patch) {
-  const { core, slashMessages } = splitPatchForGateway(patch)
-  let result
-  if (Object.keys(core).length > 0) {
-    result = await runGatewayCall('sessions.patch', gatewaySessionPatchParams(sessionKey, core))
-  }
-  for (const message of slashMessages) {
-    result = await runGatewayCall(
-      'chat.send',
-      { sessionKey, message, idempotencyKey: crypto.randomUUID() },
-      60000,
-    )
-    invalidateHistoryCacheForSessionKey(sessionKey)
-  }
-  return result
+  return applyGatewaySessionPreferencePatchImpl(sessionKey, patch, {
+    runGatewayCall,
+    invalidateHistoryCacheForSessionKey,
+    cryptoImpl: crypto,
+  })
 }
 
 /**
