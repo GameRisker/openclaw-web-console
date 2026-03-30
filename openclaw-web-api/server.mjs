@@ -10,6 +10,15 @@ import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import { runGatewayCall as runGatewayCallCli, runOpenClawJson } from './lib/openclaw-cli.mjs'
 import { loadModelsCatalogPayload } from './lib/models.mjs'
+import {
+  HISTORY_PAGE_DEFAULT,
+  buildChatHistoryParams,
+  createHistoryCache,
+  loadHistoryMappedForSession as loadHistoryMappedForSessionImpl,
+  parseHistoryBeforeFromQuery,
+  parseHistoryLimit,
+  sortMappedHistoryMessages,
+} from './lib/history-service.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -33,11 +42,6 @@ function getOpenClawStateDir() {
   return path.join(os.homedir(), '.openclaw')
 }
 
-/**
- * WS 订阅首包 / 未传 limit 时的默认条数。
- * 须与 openclaw-web-client/src/constants/history.ts 的 HISTORY_PAGE_SIZE 一致。
- */
-const HISTORY_PAGE_DEFAULT = 20
 const HISTORY_PAGE_MAX = 200
 
 /** 网关 connect 请求的 scopes；部分网关要求 operator.admin，可通过 OPENCLAW_WEB_GATEWAY_SCOPES 覆盖（逗号分隔）。 */
@@ -47,23 +51,6 @@ function gatewayConnectScopes() {
   return ['operator.read', 'operator.write', 'operator.admin']
 }
 
-function parseHistoryLimit(raw) {
-  const n = Number.parseInt(String(raw ?? ''), 10)
-  if (!Number.isFinite(n) || n < 1) return HISTORY_PAGE_DEFAULT
-  return Math.min(HISTORY_PAGE_MAX, Math.floor(n))
-}
-
-function buildChatHistoryParams(sessionKey, limit, before) {
-  const params = { sessionKey, limit }
-  if (before) params.before = before
-  return params
-}
-
-function sortMappedHistoryMessages(mapped) {
-  return [...mapped].sort(
-    (a, b) => toTimestampMs(a.timestamp) - toTimestampMs(b.timestamp) || String(a.id).localeCompare(String(b.id)),
-  )
-}
 
 /** 网关若返回精确 hasMore，优先采用；否则用「本页条数 >= limit」启发式 */
 function pickGatewayHasMoreFlag(raw) {
@@ -89,13 +76,6 @@ function applyBeforeCursorSanitize(mappedSortedAsc, beforeId) {
   const idx = mappedSortedAsc.findIndex((m) => m.id === beforeId)
   if (idx >= 0) return mappedSortedAsc.slice(0, idx)
   return mappedSortedAsc.filter((m) => m.id !== beforeId)
-}
-
-function parseHistoryBeforeFromQuery(query) {
-  const raw = query.before ?? query.beforeMessageId ?? query.cursor ?? query.before_id
-  if (raw == null) return undefined
-  const s = String(raw).trim()
-  return s === '' ? undefined : s
 }
 
 app.use(express.json())
@@ -713,112 +693,24 @@ function mapHistoryMessages(sessionId, history) {
   })
 }
 
-/**
- * `chat.history` 二级缓存（进程内 LRU）。见 docs/backend-history-cache-proposal.md §4。
- * 多实例部署无共享缓存时各进程独立；可设 HISTORY_CACHE_ENABLED=0 关闭。
- */
-const HISTORY_CACHE_ENABLED = !/^0|false|no$/i.test(String(process.env.HISTORY_CACHE_ENABLED ?? '1').trim())
-const HISTORY_CACHE_MAX_ENTRIES = Math.min(
-  2000,
-  Math.max(16, Number.parseInt(process.env.HISTORY_CACHE_MAX_ENTRIES ?? '256', 10) || 256),
-)
-const HISTORY_CACHE_TTL_MS = Math.max(0, Number.parseInt(process.env.HISTORY_CACHE_TTL_MS ?? '0', 10) || 0)
-
-const historyResponseCache = new Map()
-
-function historyCacheStorageKey(sessionKey, limit, before) {
-  return `${sessionKey}\x1e${limit}\x1e${before ?? ''}`
-}
-
-function historyCacheTouch(storageKey, entry) {
-  if (historyResponseCache.has(storageKey)) historyResponseCache.delete(storageKey)
-  historyResponseCache.set(storageKey, entry)
-  while (historyResponseCache.size > HISTORY_CACHE_MAX_ENTRIES) {
-    const oldest = historyResponseCache.keys().next().value
-    historyResponseCache.delete(oldest)
-  }
-}
-
-function historyCacheGet(storageKey) {
-  const entry = historyResponseCache.get(storageKey)
-  if (!entry) return null
-  if (HISTORY_CACHE_TTL_MS > 0 && Date.now() - entry.at > HISTORY_CACHE_TTL_MS) {
-    historyResponseCache.delete(storageKey)
-    return null
-  }
-  historyResponseCache.delete(storageKey)
-  historyResponseCache.set(storageKey, entry)
-  return entry
-}
+const historyCache = createHistoryCache()
 
 function invalidateHistoryCacheForSessionKey(sessionKey) {
-  if (!sessionKey) return
-  const prefix = `${sessionKey}\x1e`
-  for (const k of [...historyResponseCache.keys()]) {
-    if (k.startsWith(prefix)) historyResponseCache.delete(k)
-  }
-}
-
-/**
- * 网关若不支持 `before`（或传了即报错），`chat.history` 会整段失败 → Web 收到 500。
- * 降级：不带 before 拉一段窗口，在内存里按 beforeId 取「严格更早」且取靠近游标的最多 limit 条。
- */
-function sliceOlderPageBeforeId(wideMappedAsc, beforeId, limit) {
-  const idx = wideMappedAsc.findIndex((m) => m.id === beforeId)
-  if (idx < 0) {
-    return { page: [], hasMore: false, foundCursor: false }
-  }
-  const older = wideMappedAsc.slice(0, idx)
-  const page = older.length <= limit ? older : older.slice(older.length - limit)
-  const hasMore = older.length > limit
-  return { page, hasMore, foundCursor: true }
+  historyCache.invalidateSession(sessionKey)
 }
 
 async function loadHistoryMappedForSession(sessionId, sessionKey, limit, before) {
-  const storageKey = historyCacheStorageKey(sessionKey, limit, before ?? '')
-  if (HISTORY_CACHE_ENABLED) {
-    const hit = historyCacheGet(storageKey)
-    if (hit) {
-      return { messages: structuredClone(hit.messages), hasMore: hit.hasMore }
-    }
-  }
-
-  let history
-  let mapped
-  let hasMore
-
-  try {
-    history = await runGatewayCall('chat.history', buildChatHistoryParams(sessionKey, limit, before))
-    mapped = sortMappedHistoryMessages(mapHistoryMessages(sessionId, history))
-    if (before) mapped = applyBeforeCursorSanitize(mapped, before)
-    hasMore = computeHistoryHasMore(history, mapped.length, limit)
-  } catch (err) {
-    if (!before) throw err
-    bridgeLog('chat.history+before failed; wide fetch without before', {
-      sessionKey,
-      limit,
-      before,
-      err: err instanceof Error ? err.message : String(err),
-    })
-    const wideLimit = Math.min(HISTORY_PAGE_MAX, Math.max(limit * 20, 80))
-    history = await runGatewayCall('chat.history', buildChatHistoryParams(sessionKey, wideLimit, undefined))
-    const wideMapped = sortMappedHistoryMessages(mapHistoryMessages(sessionId, history))
-    const { page, hasMore: hm, foundCursor } = sliceOlderPageBeforeId(wideMapped, before, limit)
-    mapped = page
-    if (!foundCursor) {
-      bridgeLog('history before id missing in wide window', {
-        before,
-        wideLimit,
-        wideLen: wideMapped.length,
-      })
-    }
-    hasMore = foundCursor ? hm : false
-  }
-
-  if (HISTORY_CACHE_ENABLED) {
-    historyCacheTouch(storageKey, { at: Date.now(), messages: structuredClone(mapped), hasMore })
-  }
-  return { messages: mapped, hasMore }
+  return loadHistoryMappedForSessionImpl({
+    sessionId,
+    sessionKey,
+    limit,
+    before,
+    runGatewayCall,
+    mapHistoryMessages,
+    toTimestampMs,
+    cache: historyCache,
+    bridgeLog,
+  })
 }
 
 /**
