@@ -8,6 +8,8 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
+import { runGatewayCall as runGatewayCallCli, runOpenClawJson } from './lib/openclaw-cli.mjs'
+import { loadModelsCatalogPayload } from './lib/models.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -142,135 +144,15 @@ function normalizeSession(item) {
 }
 
 /** `provider/model` → { modelProvider, model } */
-function splitProviderFromId(fullId) {
-  const s = String(fullId ?? '').trim()
-  const i = s.indexOf('/')
-  if (i <= 0) return { modelProvider: undefined, model: s }
-  return { modelProvider: s.slice(0, i), model: s.slice(i + 1) }
-}
 
 /**
  * 统一为 Web 使用的条目：id、model、name、可选 modelProvider（与 openclaw models list --json 等对齐）。
  * 字符串视为完整 id（如 openai/gpt-4o）。
  */
-function normalizeModelCatalogEntry(item) {
-  if (typeof item === 'string') {
-    const id = item.trim()
-    if (!id) return null
-    const sp = splitProviderFromId(id)
-    return {
-      id,
-      model: sp.model,
-      name: id,
-      label: id,
-      ...(sp.modelProvider ? { modelProvider: sp.modelProvider } : {}),
-    }
-  }
-  if (!item || typeof item !== 'object') return null
 
-  const prov = item.modelProvider ?? item.provider ?? item.vendor
-  const modOnly = item.model != null && String(item.model).trim() !== '' ? String(item.model).trim() : null
 
-  let id =
-    item.key != null && String(item.key).trim() !== ''
-      ? String(item.key).trim()
-      : item.id != null && String(item.id).trim() !== ''
-        ? String(item.id).trim()
-        : null
 
-  if (!id && modOnly && prov) id = `${String(prov).trim()}/${modOnly}`
-  if (!id && modOnly) id = modOnly
-  if (!id) return null
 
-  const sp = splitProviderFromId(id)
-  const name = String(item.name ?? item.label ?? item.displayName ?? id)
-
-  const out = {
-    id,
-    model: sp.model,
-    name,
-    label: name,
-    ...(sp.modelProvider ? { modelProvider: sp.modelProvider } : {}),
-  }
-  if (typeof item.available === 'boolean') out.available = item.available
-  if (Array.isArray(item.tags)) out.tags = item.tags
-  return out
-}
-
-function normalizeModelsArray(arr) {
-  if (!Array.isArray(arr)) return []
-  const out = []
-  const seen = new Set()
-  for (const item of arr) {
-    const m = normalizeModelCatalogEntry(item)
-    if (m && !seen.has(m.id)) {
-      seen.add(m.id)
-      out.push(m)
-    }
-  }
-  return out
-}
-
-function extractModelsFromStatusLike(obj) {
-  if (!obj || typeof obj !== 'object') return []
-  const tryArrays = [
-    obj.models,
-    obj.configuredModels,
-    obj.allowedModels,
-    obj.availableModels,
-    obj.modelCatalog,
-    obj.modelChoices,
-    obj.config?.models,
-    obj.runtime?.models,
-    obj.gateway?.models,
-    obj.agent?.models,
-  ]
-  for (const a of tryArrays) {
-    const list = normalizeModelsArray(a)
-    if (list.length) return list
-  }
-  if (obj.agents && typeof obj.agents === 'object' && !Array.isArray(obj.agents)) {
-    for (const k of Object.keys(obj.agents)) {
-      const agent = obj.agents[k]
-      if (agent && typeof agent === 'object') {
-        const list = normalizeModelsArray(agent.models)
-        if (list.length) return list
-      }
-    }
-  }
-  return []
-}
-
-function parseModelsListCliResponse(raw, sourceLabel) {
-  if (!raw || typeof raw !== 'object') return null
-  const arr = Array.isArray(raw) ? raw : raw.models
-  if (!Array.isArray(arr) || arr.length === 0) return null
-  const models = normalizeModelsArray(arr)
-  return models.length
-    ? {
-        source: sourceLabel,
-        models,
-        defaultModel: raw.defaultModel ?? raw.resolvedDefault,
-        count: raw.count,
-      }
-    : null
-}
-
-function parseModelsStatusCliResponse(raw, sourceLabel) {
-  if (!raw || typeof raw !== 'object') return null
-  const allowed = raw.allowed
-  if (!Array.isArray(allowed) || allowed.length === 0) return null
-  const models = normalizeModelsArray(allowed)
-  return models.length
-    ? {
-        source: sourceLabel,
-        models,
-        defaultModel: raw.defaultModel ?? raw.resolvedDefault,
-        fallbacks: raw.fallbacks,
-        aliases: raw.aliases,
-      }
-    : null
-}
 
 /**
  * 按约定顺序探测 CLI（与 OpenClaw 文档对齐；随 CLI 演进可调整顺序）：
@@ -279,63 +161,6 @@ function parseModelsStatusCliResponse(raw, sourceLabel) {
  * 3) model list --json
  * 4) models status --json / models --status-json
  */
-async function loadModelsCatalogPayload() {
-  const attempts = [
-    {
-      label: 'openclaw status --json',
-      run: async () => {
-        const raw = await runOpenClawJson(['status', '--json'])
-        const list = extractModelsFromStatusLike(raw)
-        return list.length ? { source: 'openclaw status --json', models: list } : null
-      },
-    },
-    {
-      label: 'openclaw models list --json',
-      run: async () => parseModelsListCliResponse(await runOpenClawJson(['models', 'list', '--json']), 'openclaw models list --json'),
-    },
-    {
-      label: 'openclaw model list --json',
-      run: async () => parseModelsListCliResponse(await runOpenClawJson(['model', 'list', '--json']), 'openclaw model list --json'),
-    },
-    {
-      label: 'openclaw models status --json',
-      run: async () =>
-        parseModelsStatusCliResponse(await runOpenClawJson(['models', 'status', '--json']), 'openclaw models status --json'),
-    },
-    {
-      label: 'openclaw models --status-json',
-      run: async () =>
-        parseModelsStatusCliResponse(await runOpenClawJson(['models', '--status-json']), 'openclaw models --status-json'),
-    },
-  ]
-
-  let lastError
-  for (const { label, run } of attempts) {
-    try {
-      const r = await run()
-      if (r?.models?.length) {
-        return {
-          schemaVersion: 1,
-          source: r.source,
-          models: r.models,
-          ...(r.defaultModel != null ? { defaultModel: r.defaultModel } : {}),
-          ...(r.fallbacks != null ? { fallbacks: r.fallbacks } : {}),
-          ...(r.aliases != null ? { aliases: r.aliases } : {}),
-          ...(r.count != null ? { count: r.count } : {}),
-        }
-      }
-    } catch (e) {
-      lastError = e
-    }
-  }
-
-  return {
-    schemaVersion: 1,
-    source: 'empty',
-    models: [],
-    ...(lastError instanceof Error ? { error: lastError.message, lastAttemptNote: '所有 CLI 探测均未返回非空模型列表' } : {}),
-  }
-}
 
 async function loadGatewayConfig() {
   const raw = await fs.readFile(getOpenClawConfigPath(), 'utf8')
@@ -350,39 +175,9 @@ async function loadGatewayConfig() {
   }
 }
 
-async function runOpenClawJson(args) {
-  const { stdout } = await execFileAsync('openclaw', args, {
-    cwd: process.cwd(),
-    maxBuffer: 10 * 1024 * 1024,
-    env: process.env,
-  })
-
-  const lines = stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => !line.startsWith('[plugins]'))
-
-  return JSON.parse(lines.join('\n'))
-}
-
 async function runGatewayCall(method, params = {}, timeout = 10000) {
   const auth = await loadGatewayConfig()
-  const args = [
-    'gateway',
-    'call',
-    method,
-    '--json',
-    '--timeout',
-    String(timeout),
-    '--params',
-    JSON.stringify(params),
-  ]
-
-  if (auth.token) args.push('--token', auth.token)
-  if (auth.password) args.push('--password', auth.password)
-
-  return runOpenClawJson(args)
+  return runGatewayCallCli(method, params, timeout, auth)
 }
 
 /** 避免短时间内多次 history / send 各打一次 sessions.list（每次都是独立 openclaw 子进程，很慢） */
